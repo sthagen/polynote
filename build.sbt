@@ -1,6 +1,7 @@
 name := "polynote"
 
 val buildUI: TaskKey[Unit] = taskKey[Unit]("Building UI...")
+val distUI: TaskKey[Unit] = taskKey[Unit]("Building UI for distribution...")
 val runAssembly: TaskKey[Unit] = taskKey[Unit]("Running spark server from assembly...")
 val dist: TaskKey[File] = taskKey[File]("Building distribution...")
 val dependencyJars: TaskKey[Seq[(File, String)]] = taskKey("Dependency JARs which aren't included in the assembly")
@@ -8,12 +9,11 @@ val polynoteJars: TaskKey[Seq[(File, String)]] = taskKey("Polynote JARs")
 val sparkVersion: SettingKey[String] = settingKey("Spark version")
 
 val versions = new {
-  val http4s     = "0.20.6"
   val fs2        = "1.0.5"
   val catsEffect = "2.0.0"
   val coursier   = "2.0.0-RC2-6"
-  val zio        = "1.0.0-RC15"
-  val zioInterop = "2.0.0.0-RC6"
+  val zio        = "1.0.2"
+  val zioInterop = "2.0.0.0-RC12"
 }
 
 def nativeLibraryPath = s"${sys.env.get("JAVA_LIBRARY_PATH") orElse sys.env.get("LD_LIBRARY_PATH") orElse sys.env.get("DYLD_LIBRARY_PATH") getOrElse "."}:."
@@ -31,7 +31,7 @@ val commonSettings = Seq(
       "scm:git@github.com:polynote/polynote.git"
     )
   ),
-  version := "0.2.11-SNAPSHOT",
+  version := "0.3.12",
   publishTo := sonatypePublishToBundle.value,
   developers := List(
     Developer(id = "jeremyrsmith", name = "Jeremy Smith", email = "", url = url("https://github.com/jeremyrsmith")),
@@ -63,6 +63,10 @@ val commonSettings = Seq(
   addCompilerPlugin("org.typelevel" %% "kind-projector" % "0.10.3"),
   buildUI := {
     sys.process.Process(Seq("npm", "run", "build"), new java.io.File("./polynote-frontend/")) ! streams.value.log
+  },
+  distUI := {
+    sys.process.Process(Seq("npm", "run", "clean"), new java.io.File("./polynote-frontend/")) ! streams.value.log
+    sys.process.Process(Seq("npm", "run", "dist"), new java.io.File("./polynote-frontend/")) ! streams.value.log
   },
   scalacOptions += "-deprecation",
   test in assembly := {}
@@ -98,7 +102,8 @@ val `polynote-env` = project.settings(
   commonSettings,
   scalacOptions += "-language:experimental.macros",
   libraryDependencies ++= Seq(
-    "dev.zio" %% "zio-interop-cats" % versions.zioInterop % "provided",
+    //"dev.zio" %% "zio-interop-cats" % versions.zioInterop % "provided",
+    "dev.zio" %% "zio" % versions.zio,
     "org.scala-lang" % "scala-reflect" % scalaVersion.value % "provided"
   )
 )
@@ -110,7 +115,8 @@ val `polynote-kernel` = project.settings(
     "org.scala-lang" % "scala-compiler" % scalaVersion.value % "test",
     "org.typelevel" %% "cats-effect" % versions.catsEffect,
     "dev.zio" %% "zio" % versions.zio,
-    "dev.zio" %% "zio-interop-cats" % versions.zioInterop,
+    "dev.zio" %% "zio-streams" % versions.zio,
+    //"dev.zio" %% "zio-interop-cats" % versions.zioInterop,
     "co.fs2" %% "fs2-io" % versions.fs2,
     "org.scodec" %% "scodec-core" % "1.11.4",
     "org.scodec" %% "scodec-stream" % "1.2.0",
@@ -123,9 +129,9 @@ val `polynote-kernel` = project.settings(
     "io.circe" %% "circe-generic" % "0.11.1",
     "io.circe" %% "circe-generic-extras" % "0.11.1",
     "io.circe" %% "circe-parser" % "0.11.1",
+    "net.sf.py4j" % "py4j" % "0.10.7",
     "org.scalamock" %% "scalamock" % "4.4.0" % "test"
   ),
-  publish := {},
   coverageExcludedPackages := "polynote\\.kernel\\.interpreter\\.python\\..*;polynote\\.runtime\\.python\\..*" // see https://github.com/scoverage/scalac-scoverage-plugin/issues/176
 ).dependsOn(`polynote-runtime` % "provided", `polynote-runtime` % "test", `polynote-env`)
 
@@ -133,17 +139,17 @@ val `polynote-server` = project.settings(
   commonSettings,
   libraryDependencies ++= Seq(
     "org.scala-lang" % "scala-compiler" % scalaVersion.value % "provided",
-    "org.http4s" %% "http4s-core" % versions.http4s,
-    "org.http4s" %% "http4s-dsl" % versions.http4s,
-    "org.http4s" %% "http4s-blaze-server" % versions.http4s,
-    "org.http4s" %% "http4s-blaze-client" % versions.http4s,
+    "org.polynote" %% "uzhttp" % "0.2.6",
     "org.scodec" %% "scodec-core" % "1.10.3",
     "com.vladsch.flexmark" % "flexmark" % "0.34.32",
     "com.vladsch.flexmark" % "flexmark-ext-yaml-front-matter" % "0.34.32",
     "org.slf4j" % "slf4j-simple" % "1.7.25"
   ),
-  publish := {},
-  unmanagedResourceDirectories in Compile += (ThisBuild / baseDirectory).value / "polynote-frontend" / "dist"
+  //unmanagedResourceDirectories in Compile += (ThisBuild / baseDirectory).value / "polynote-frontend" / "dist",
+  packageBin := {
+    val _ = distUI.value
+    (packageBin in Compile).value
+  }
 ).dependsOn(`polynote-runtime` % "provided", `polynote-runtime` % "test", `polynote-kernel` % "compile->compile;test->test")
 
 val sparkSettings = Seq(
@@ -176,7 +182,6 @@ lazy val `polynote-spark` = project.settings(
     "org.scala-lang" % "scala-compiler" % scalaVersion.value % "provided",
     "org.scodec" %% "scodec-stream" % "1.2.0"
   ),
-  publish := {},
   dependencyJars := {
     (dependencyClasspath in (`polynote-kernel`, Compile)).value.collect {
       case jar if jar.data.name.matches(".*scala-(library|reflect|compiler|collection-compat|xml).*") =>
@@ -204,14 +209,14 @@ lazy val `polynote-spark` = project.settings(
   `polynote-runtime` % "provided",
   `polynote-runtime` % "test")
 
-lazy val polynote = project.in(file(".")).aggregate(`polynote-runtime`, `polynote-spark-runtime`, `polynote-kernel`, `polynote-server`, `polynote-spark`)
+lazy val polynote = project.in(file(".")).aggregate(`polynote-env`, `polynote-runtime`, `polynote-spark-runtime`, `polynote-kernel`, `polynote-server`, `polynote-spark`)
     .settings(
       commonSettings,
       dist := {
         val jars = ((assembly in (`polynote-spark`, Compile)).value -> "polynote/polynote.jar") +:
           ((polynoteJars in (`polynote-spark`, Compile)).value ++ (dependencyJars in (`polynote-spark`, Compile)).value)
 
-        val examples = IO.listFiles(file(".") / "docs" / "examples").map(f => (f, s"polynote/notebooks/examples/${f.getName}"))
+        val examples = IO.listFiles(file(".") / "docs" / "examples").map(f => (f, s"polynote/examples/${f.getName}"))
 
         val versionTag = scalaBinaryVersion.value match {
           case "2.11" => ""
@@ -229,7 +234,7 @@ lazy val polynote = project.in(file(".")).aggregate(`polynote-runtime`, `polynot
 
         val files = jars ++ examples ++ List(
           (file(".") / "config-template.yml") -> "polynote/config-template.yml",
-          (file(".") / "scripts" / "polynote") -> "polynote/polynote",
+          (file(".") / "requirements.txt") -> "polynote/requirements.txt",
           (file(".") / "scripts" / "plugin") -> "polynote/plugin",
           (file(".") / "scripts" / "polynote.py") -> "polynote/polynote.py")
 
@@ -242,6 +247,8 @@ lazy val polynote = project.in(file(".")).aggregate(`polynote-runtime`, `polynot
         }
 
         IO.copy(resolvedFiles, overwrite = true, preserveLastModified = true, preserveExecutable = true)
+
+        IO.copyDirectory(file(".") / "polynote-frontend" / "dist" / "static", targetDir / "static")
 
         val rootPath = crossTarget.value.toPath
         def relative(file: File): String = rootPath.relativize(file.toPath).toString

@@ -2,6 +2,10 @@
 import sys
 from pathlib import Path
 import os
+import shlex
+
+if not os.environ.get('PYTHONPATH'):
+    os.environ['PYTHONPATH'] = sys.prefix
 
 polynote_dir = os.path.dirname(os.path.realpath(__file__))
 os.chdir(polynote_dir)
@@ -26,7 +30,8 @@ if not(deps_path.exists()):
     raise Exception("Couldn't find the deps directory. Are we in the polynote installation directory?")
 
 deps = Path(polynote_dir).joinpath("deps").glob("*.jar")
-classpath = "polynote.jar:" + ":".join([ str(d) for d in deps ])
+classpath = "polynote.jar:" + ":".join([":".join([ f'"{d}"' for d in deps ]), ":".join([ f'"{p}"' for p in plugins ])])
 cmd = f"java -cp polynote.jar:{classpath} -Djava.library.path={jep_path} polynote.Main {' '.join(sys.argv[1:])}"
+cmd = shlex.split(cmd)
 print(cmd)
-os.system(cmd)
+os.execvp(cmd[0], cmd)

@@ -68,11 +68,13 @@ trait State {
     */
   def takeUntil(fn: State => Boolean): List[State] = {
     var state = this
-    val result = ListBuffer(state)
+    val result = new ListBuffer[State]
     while (!(state eq Root) && !fn(state)) {
-      state = state.prev
       result += state
+      state = state.prev
     }
+    if (fn(state) && !(state eq Root)) result += state
+
     result.toList
   }
 
@@ -145,15 +147,6 @@ trait State {
   } else withPrev(prev.insert(after, state))
 
   /**
-    * Replace the state with the same ID as the given state with the given state
-    */
-  def replace(state: State): State = if (state.id == id) {
-    state.withPrev(prev)
-  } else if (this != Root) {
-    withPrev(prev.replace(state))
-  } else this
-
-  /**
     * Replace the state with the same ID as the given state with the given state. If a state with the given state's
     * predecessor is found before a state with the same ID as the given state, the given state will be inserted
     * between the predecessor and its successor.
@@ -196,7 +189,7 @@ object State {
     override def withPrev(prev: State): State = copy(prev = prev)
     override def updateValues(fn: ResultValue => ResultValue): State = copy(values = values.map(fn))
     override def updateValuesM[R](fn: ResultValue => RIO[R, ResultValue]): RIO[R, State] =
-      ZIO.sequence(values.map(fn)).map(values => copy(values = values))
+      ZIO.collectAll(values.map(fn)).map(values => copy(values = values))
   }
 
   val root: State = Root

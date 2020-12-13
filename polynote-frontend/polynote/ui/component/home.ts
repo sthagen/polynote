@@ -1,34 +1,34 @@
-"use strict";
+import {div, h2, h3, img, para, polynoteLogo, span, tag, TagElement} from "../tags";
+import {LoadNotebook, ServerMessageDispatcher, SetSelectedNotebook} from "../../messaging/dispatcher";
+import {RecentNotebooks, RecentNotebooksHandler} from "../../state/preferences";
 
-import {TriggerItem, UIMessage, UIMessageTarget} from "../util/ui_event";
-import {div, span, tag, TagElement} from "../util/tags";
-import {storage} from "../util/storage";
-
-export class HomeUI extends UIMessageTarget {
+export class Home {
     readonly el: TagElement<"div">;
-    constructor() {
-        super();
-        this.el = div(['welcome-page'], []);
-        this.el.innerHTML = `
-          <img src="/style/polynote.svg" alt="Polynote" />
-          <h2>Home</h2>
-          
-          <p>
-            To get started, open a notebook by clicking on it in the Notebooks panel, or create a new notebook by
-             clicking the Create Notebook (<span class="create-notebook icon fas"><img class="icon" src="/style/icons/fa/plus-circle.svg"/></span>) button.
-          </p>
-          
-          <h3>Recent notebooks</h3>
-          <ul class="recent-notebooks"></ul>  
-        `;
 
-        const recent = this.el.querySelector('.recent-notebooks');
-        (storage.get('recentNotebooks') || []).forEach((nb: {name: string, path: string}) => {
-            recent!.appendChild(
-                tag('li', ['notebook-link'], {}, [
-                    span([], nb.name).click(() => this.publish(new TriggerItem(nb.path)))
-                ])
-            );
-        });
+    constructor(dispatcher: ServerMessageDispatcher) {
+
+        const recentNotebooks = tag('ul', ['recent-notebooks'], {}, []);
+        this.el = div(['welcome-page'], [
+            polynoteLogo(),
+            h2([], ["Home"]),
+            para([], [
+                "To get started, open a notebook by clicking on it in the Notebooks panel, or create a new notebook by\n" +
+                "             clicking the Create Notebook (",
+                span(['create-notebook', 'icon'], [img(["icon"], "static/style/icons/fa/plus-circle.svg")]), ") button."
+            ]),
+            h3([], ["Recent Notebooks"]),
+            recentNotebooks
+        ]);
+
+        const handleRecents = (recents: RecentNotebooks) => {
+            recentNotebooks.innerHTML = "";
+            recents.forEach(({name, path}) => {
+                recentNotebooks.appendChild(tag('li', ['notebook-link'], {}, [
+                    span([], [path]).click(() => dispatcher.loadNotebook(path).then(() => dispatcher.dispatch(new SetSelectedNotebook(path))))
+                ]))
+            })
+        }
+        handleRecents(RecentNotebooksHandler.state)
+        RecentNotebooksHandler.addObserver(nbs => handleRecents(nbs))
     }
 }

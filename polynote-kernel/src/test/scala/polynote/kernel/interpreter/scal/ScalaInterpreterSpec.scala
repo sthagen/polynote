@@ -5,10 +5,10 @@ import cats.data.StateT
 import cats.syntax.traverse._
 import cats.instances.list._
 import org.scalatest.{FreeSpec, Matchers}
-import polynote.kernel.{Output, Result, ResultValue, ScalaCompiler, TaskInfo}
+import polynote.kernel.{Completion, CompletionType, Output, Result, ResultValue, ScalaCompiler, TaskInfo}
 import polynote.testing.{InterpreterSpec, ValueMap, ZIOSpec}
 import polynote.messages.CellID
-import zio.{RIO, ZIO}
+import zio.{RIO, ZIO, ZLayer}
 import zio.blocking.Blocking
 import zio.clock.Clock
 import zio.console.Console
@@ -23,10 +23,7 @@ import scala.tools.nsc.Settings
 
 class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
 
-  val interpreter: ScalaInterpreter = ScalaInterpreter().provide(new ScalaCompiler.Provider with Blocking {
-    val scalaCompiler: ScalaCompiler = compiler
-    override val blocking: Blocking.Service[Any] = ScalaInterpreterSpec.this.Environment.blocking
-  }).runIO()
+  val interpreter: ScalaInterpreter = ScalaInterpreter().provideSomeLayer[Environment](ZLayer.succeed(compiler)).runIO()
   import interpreter.ScalaCellState
 
 
@@ -35,22 +32,59 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
     ValueMap(result.state.values) shouldEqual Map("foo" -> 22)
   }
 
-  "capture standard output" in {
-    val result = interp1("""println("hello")""")
+  "capture standard output" - {
+    "single-line string" in {
+      val result = interp1("""println("hello")""")
+      stdOut(result.env.publishResult.toList.runIO()) shouldEqual "hello\n"
+    }
 
-    stdOut(result.env.publishResult.toList.runIO()) shouldEqual "hello\n"
+    "multi-line string" in {
+      val result = interp1(
+        s"""println(">>>Multi-line string")
+          |println(${"\"\"\""}A: 1
+          |    |B: 2
+          |    |C: 3${"\"\"\""}.stripMargin)
+          |""".stripMargin)
+      stdOut(result.env.publishResult.toList.runIO()) shouldEqual
+        """>>>Multi-line string
+          |A: 1
+          |B: 2
+          |C: 3
+          |""".stripMargin
+    }
   }
 
-  "bring values from previous cells" in {
-    val test = for {
-      res1 <- interp("val foo = 22")
-      res2 <- interp("val bar = foo + 10")
-    } yield (res1, res2)
+  "bring values from previous cells" - {
+    "when referenced directly" in {
+      val test = for {
+        res1 <- interp("val foo = 22")
+        res2 <- interp("val bar = foo + 10")
+      } yield (res1, res2)
 
-    val (finalState, (res1, res2)) = test.run(cellState).runIO()
+      val (finalState, (res1, res2)) = test.run(cellState).runIO()
 
-    res2.state.values match {
-      case ValueMap(values) => values("bar") shouldEqual 32
+      res2.state.values match {
+        case ValueMap(values) => values("bar") shouldEqual 32
+      }
+    }
+    "when referenced by type only" in {
+      val test = for {
+        res1 <- interp("class Foo")
+        res2 <- interp("val fooCls = classOf[Foo]")
+        res3 <- interp("object Bar { class Baz }")
+        res4 <- interp("val bazCls = classOf[Bar.Baz]")
+//        res5 <- interp("val bar = Bar")
+//        res6 <- interp("val barBazCls = classOf[bar.Baz]")
+      } yield (res2, res4 /* , res6 */)
+
+      val (finalState, res) = test.run(cellState).runIO()
+
+      (res._1.state.values ++ res._2.state.values /* ++ res._3.state.values */) match {
+        case ValueMap(values) =>
+          values("fooCls").toString.contains("$Foo") shouldBe true
+          values("bazCls").toString.contains("$Bar$Baz") shouldBe true
+//          values("barBazCls").toString.contains("$Bar$Baz") shouldBe true
+      }
     }
   }
 
@@ -140,6 +174,22 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
       val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
       scopeMap("b") shouldEqual 20
     }
+
+    "class with explicit companion" in {
+      val test = for {
+        _ <- interp(
+          """package explicitCompanion
+            |sealed abstract class TestClass { def m = 10 }
+            |object TestClass extends TestClass""".stripMargin)
+        _ <- interp("val result = TestClass.m")
+        _ <- interp("val cls = classOf[TestClass]")
+      } yield ()
+
+      val (finalState, _) = test.run(cellState).runIO()
+      val scopeMap = finalState.scope.map(r => r.name.toString -> r.value).toMap
+      scopeMap("result") shouldEqual 10
+      scopeMap("cls").asInstanceOf[Class[_]].getSimpleName shouldEqual "TestClass"
+    }
   }
 
   /**
@@ -178,6 +228,15 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
     val (finalState, results) = interp("val foo257 = 257").run(State.id(257, prevState)).runIO()
     ValueMap(results.state.values) shouldEqual Map("foo257" -> 257)
     ValueMap(results.state.scope) shouldEqual (0 to 257).map(i => s"foo$i" -> i).toMap
+  }
+
+  "lazy vals don't crash" in {
+    val test = for {
+      _ <- interp("lazy val x = 10")
+      _ <- interp("val y = x * 2")
+    } yield ()
+    val (finalState, _) = test.run(cellState).runIO()
+    ValueMap(finalState.scope)("y") shouldEqual 20
   }
 
   "cases from previous scala interpreter" - {
@@ -297,6 +356,75 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
       assertOutput(code) {
         (vars, output) =>
           vars.toSeq should contain theSameElementsAs List("foo" -> 1, "bar" -> "one")
+      }
+    }
+
+  }
+
+  "completions" - {
+    def completionsMap(code: String, pos: Int, state: State = cellState) =
+      interpreter.completionsAt(code, pos, state).runIO().groupBy(_.name.toString)
+
+    "complete class defined in cell" in {
+      val code = """class Foo() {
+                   |  def someMethod(): Int = 22
+                   |}
+                   |
+                   |val test = new Foo()
+                   |test.""".stripMargin
+      val completions = completionsMap(code, code.length)
+      val List(someMethod) = completions("someMethod")
+      someMethod.completionType shouldEqual CompletionType.Method
+      someMethod.resultType shouldEqual "Int"
+    }
+
+    "inside apply trees" - {
+      "one level deep" in {
+        val code =
+          """class Foo() { def someMethod(): Int = 22 }
+            |val test = new Foo()
+            |val result = println(test.)
+            |""".stripMargin
+        val completions = completionsMap(code, code.indexOf("test.") + "test.".length)
+        val List(someMethod) = completions("someMethod")
+        someMethod.completionType shouldEqual CompletionType.Method
+        someMethod.resultType shouldEqual "Int"
+      }
+    }
+
+    "imported method" in {
+      val state = interp1("import scala.math.log10").state
+      val completions = completionsMap("l", 1, State.id(2, state))
+      val List(log10) = completions("log10")
+      log10.completionType shouldEqual CompletionType.Method
+      log10.resultType shouldEqual "Double"
+    }
+
+    "extension methods" in {
+      val state = interp1("import scala.collection.JavaConverters._").state
+      val code = "List(1, 2, 3).asJ"
+      val completions = completionsMap(code, code.length, State.id(2, state))
+      val List(asJava) = completions("asJava")
+      asJava.completionType shouldEqual CompletionType.Method
+      asJava.resultType shouldEqual "List[Int]"
+    }
+
+    "value from previous cell" in {
+      val state = interp1("val shouldBeVisible = 10").state
+      val code = "val butIsIt = sh"
+      val completions = completionsMap(code, code.length, State.id(2, state))
+      val List(shouldBeVisible) = completions("shouldBeVisible")
+      shouldBeVisible.completionType shouldEqual CompletionType.Term
+      shouldBeVisible.resultType shouldEqual "Int"
+    }
+
+    "from class indexer" - {
+      "imports" in {
+        val code = "import HashM"
+        interpreter.awaitIndexer.runIO()
+        val completions = completionsMap(code, code.length, State.id(1))
+        val expected = Completion("HashMap", Nil, Nil, "scala.c.immutable", CompletionType.Unknown, Some("scala.collection.immutable.HashMap"))
+        completions("HashMap") should contain (expected)
       }
     }
 

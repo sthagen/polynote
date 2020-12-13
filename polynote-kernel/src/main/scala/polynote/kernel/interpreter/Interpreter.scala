@@ -4,14 +4,14 @@ package interpreter
 import java.util.ServiceLoader
 
 import scala.collection.JavaConverters._
-
 import cats.syntax.semigroup._
 import cats.instances.map._
 import cats.instances.list._
 import polynote.messages.CellID
-import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask, InterpreterEnvironment}
+import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask}
+import polynote.kernel.task.TaskManager
 import zio.blocking.{Blocking, effectBlocking}
-import zio.{Task, RIO, ZIO}
+import zio.{Has, Layer, RIO, Task, ZIO, ZLayer}
 
 trait Interpreter {
 
@@ -34,7 +34,7 @@ trait Interpreter {
     *              initially have empty values. Its `prev` will point to the [[State]] returned by the closes prior
     *              executed cell, or to [[State.Root]] if there is no such cell.
     */
-  def completionsAt(code: String, pos: Int, state: State): Task[List[Completion]]
+  def completionsAt(code: String, pos: Int, state: State): RIO[Blocking, List[Completion]]
 
   /**
     * Ask for parameter hints (if applicable) at the given position in the given code string.
@@ -45,7 +45,7 @@ trait Interpreter {
     *              initially have empty values. Its `prev` will point to the [[State]] returned by the closes prior
     *              executed cell, or to [[State.Root]] if there is no such cell.
     */
-  def parametersAt(code: String, pos: Int, state: State): Task[Option[Signatures]]
+  def parametersAt(code: String, pos: Int, state: State): RIO[Blocking, Option[Signatures]]
 
   /**
     * Initialize the interpreter, running any predef code and setting up an initial state.
@@ -75,12 +75,16 @@ object Interpreter {
     def priority: Int = 0
   }
 
-  trait Factories {
-    val interpreterFactories: Map[String, List[Interpreter.Factory]]
+  type Factories = Has[Map[String, List[Interpreter.Factory]]]
+
+  object Factories {
+    def layer(factories: Map[String, List[Interpreter.Factory]]): Layer[Nothing, Factories] = ZLayer.succeed(factories)
+    def load: ZLayer[Blocking, Throwable, Factories] = ZLayer.fromEffect(Loader.load)
+    def access: ZIO[Factories, Nothing, Map[String, List[Interpreter.Factory]]] = ZIO.access[Factories](_.get)
   }
 
   def availableFactories(language: String): RIO[Factories, List[Interpreter.Factory]] = for {
-    allFactories <- ZIO.access[Factories](_.interpreterFactories)
+    allFactories <- ZIO.access[Factories](_.get)
     factories    <- ZIO.fromOption(allFactories.get(language)).mapError(_ => new IllegalArgumentException(s"No interpreter for $language"))
   } yield factories
 
@@ -91,7 +95,8 @@ trait Loader {
 }
 
 object Loader {
-  def load: RIO[Blocking, Map[String, List[Interpreter.Factory]]] = effectBlocking(ServiceLoader.load(classOf[Loader]).iterator.asScala.toList).map {
+  private lazy val unsafeLoad = ServiceLoader.load(classOf[Loader]).iterator.asScala.toList
+  def load: RIO[Blocking, Map[String, List[Interpreter.Factory]]] = effectBlocking(unsafeLoad).map {
     loaders =>
       loaders.map(_.factories.mapValues(List(_))).foldLeft(Map.empty[String, List[Interpreter.Factory]])(_ |+| _).mapValues(_.sortBy(f => (-f.priority, !f.getClass.getName.startsWith("polynote"), f.getClass.getName)))
   }

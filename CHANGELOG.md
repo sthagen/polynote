@@ -1,6 +1,157 @@
-# UNRELEASED 
+# 0.3.12 (Sep 16, 2020)
+* Fix an issue with Python Data Classes
+* Fix issues importing Zeppelin notebooks
+* Fix some dependency resolution bugs (Thanks @JD557)
+* Fix an issue improperly decoding URI components (Thanks @akiyamaneko)
+* Other minor bug fixes
 
-* 
+# 0.3.11 (Jun 10, 2020)
+* Fix a regression which stopped certain error types from appearing in the UI
+* Check Notebook read permission when loading a notebook. 
+
+# 0.3.10 (May 29, 2020)
+* New experimental Dark Mode (feedback welcome!)
+* Ability to directly paste images into text cells (image button on toolbar still doesn't do anything, but at least now it's possible to insert an image without it having to already have a URL)
+* Notebooks are loaded incrementally (better responsiveness for large notebook files)
+* Some tweaks/fixes for Scala completions and signature help
+* Handle case when the browser generates continuation frames over the websocket
+
+# 0.3.9 (May 18, 2020)
+* Replaces `0.3.8`, which was retracted after we found a few issues in it that weren't caught. 
+* **Stability** A bug that could cause data loss has been fixed in this release. 
+* **Backups** Polynote now writes a write-ahead-log (WAL) whenever it gets updates to a notebook. This WAL can be recovered using `polynote.py recover /path/to/wal-file.wal`. This is currently experimental.
+* **Backups** Polynote now saves a copy of opened notebooks into the browser's local database. This can be used in case of catastrophic server-side data loss (but where the client has been working). 
+* **New** Added a "notebook runner", invoked with `polynote.py run [OPTIONS] input-file input-files*` that can run notebooks in headless mode 
+* Lots of fixes to the Plot UI (Thanks @JD557!) 
+* Handle naming collisions between Java and Python package imports. Python packages with JVM-like names no longer get swallowed by the Jep importer. 
+
+# 0.3.7 (Apr 26, 2020)
+* Fixed bug: saving plots doesn't work because websocket connection dies for no apparent reason
+* Fixed bug: Value of zero or `false` causes `[object Object]` in table view... *sigh* javascript
+* Fixed issue: Plotting pandas DataFrame fails when column identifiers have non-string type (thanks @Baoqi!)
+* Configurable port range for remote kernel comms (thanks @hadrienk!)
+* Parallel downloads of JVM dependencies
+* Allow complex data structure display in table view
+* Fixed some edge cases in Scala code that defines classes/types/methods and uses them in later cells
+
+# 0.3.6 (Apr 1, 2020)
+* Fixed regressions:
+  * Cancel button not working
+  * Rename active notebook causes bad state / data loss
+  * Configured `listen` interface was ignored
+  * Crash in SQL interpreter
+  * JavaScript error when attempting parameter hints
+* Fix issue with launcher script
+* Fix multiple series in bar chart (Thanks @JD557!)
+* Surface error if kernel dies before finishing startup
+
+# 0.3.5 (Mar 26, 2020)
+* Fixed plugin script
+* Fixed avatar images in commenting UI (when identity supports them)
+* Added configuration for a "default" spark props template
+* Reverted bug in remote kernel logging
+
+# 0.3.4 (Mar 25, 2020) 
+* Switch HTTP server to https://github.com/polynote/uzhttp (this affects the `IdentityProvider.Service` interface)
+* Update to ZIO 1.0.0-RC18-2 (this deprecates the `Enrich` macro)
+* Front-end static files were moved out of the application JAR, so they can be served directly on disk. This changes the directory structure of the polynote installation by adding a `static` directory which contains the (gzipped) static files. These static files can now be served directly by a dedicated webserver if so desired.
+* Write `language_info` metadata to ipynb files (improves interop with notebook tools)
+
+# 0.3.3 (Mar 19, 2020)
+* *Automatic conversion of PySpark <-> Spark DataFrames* - it no longer matters which language you used to create the DataFrame!
+* *Comment support* Code cells only for now. Highlight some text in a code cell and you'll be able to add a comment, similar to Google Docs. 
+* *Environment Variable Configuration* Requires isolated kernels. Can now set environment variables to be passed to the notebook process.
+* Improvements to Pandas DataFrame support. 
+* Add new `Run to cursor` hotkey - it's `Ctrl + Alt + F9`. Thanks @kuckjwi0928 !
+* Added support for more IPython repr formats: Polynote now understands `_repr_svg_`, `_repr_jpeg_`, `_repr_png_`, and `_repr_mimebundle_`
+* Improvement to autocomplete - it should now be higher quality and won't trigger for weird characters like `:`
+* Python completion improvements: Function parameter hints should now have types, dictionaries now have key completions, 
+  and `jedi` has been updated [for even more goodies](https://github.com/davidhalter/jedi/blob/master/CHANGELOG.rst#0160-2020-01-26)
+* Fixed some more bugs in the Python interpreter
+* Fix config number format issue. Thanks @bgparkerdev !
+* A bunch of other fixes and improvements!
+
+# 0.3.2 (Feb 21, 2020)
+* Fix issue where kernel hangs trying to find `ReprsOf` something that has `var`s in it
+* Make `kernel` variable implicit so it can be threaded into functions
+
+# 0.3.1 (Feb 19, 2020)
+* Remove deprecated `polynote` shell script (use `python.py` instead)
+* Disable notebook if writing fails repeatedly
+* Unmangle package name for Spark 2.4.4 compatibility
+* Validate config on server startup
+* Respect language from imported Jupyter notebook
+* Don't save stdout to the notebook if it's subsequently been erased
+* Fix docker build for Scala 2.12/Spark 2.4
+* Misc UI and backend fixes
+
+# 0.3.0 (Feb 4, 2020)
+* Better handling of unexpected kernel shutdowns 
+* Presence 
+* Add copy notebook 
+* Use index for import 
+* Use class indexer 
+* Manually call atexit shutdown hooks 
+* Fix Py4j version handling 
+* Added browser notifications for completed cells of unfocused notebooks 
+* Fix some websocket issues 
+* Adds UI x to close error boxes 
+* Retrieve causes of python exceptions 
+* Get jars from `SPARK_DIST_CLASSPATH` with config 
+
+# 0.2.17 (Jan 14, 2020)
+
+* Create a websocket for every notebook
+* Fixes for configuring pyspark executable locations
+
+# 0.2.16 (Jan 9, 2020)
+
+* Fixed some plotting and streaming data bugs 
+* Better completions 
+* Refactor the way notebook files are encoded/decoded and stored. Also fixes some issues in Zeppelin notebook import. 
+* Address `serialize-javascript` vulnerability
+* New hotkey, `Shift+F10`, to run all cells (thanks @kuckjwi0928) 
+* Additional bugfixes and improvements
+
+# 0.2.15 (Dec 28, 2019)
+
+* Improved completions for Scala
+* Fixed regression in python+spark interpreter where `kernel` (and thus matplotlib) isn't available.
+
+# 0.2.14 (Dec 18, 2019)
+
+* `<base>` tag can now be configured and works properly
+* Renaming notebooks works properly
+* Fixed plot editor buttons
+* Improved docker build (thanks @mathematicalmichael and @JD557)
+* Removed `pysparksession` (`spark` now works properly in pyspark)
+* More improvements to python interpreter (stack traces, red squigglies, etc)
+* Compiles against JDK11 (thanks @aborg0)
+* Lazy vals don't cause errors (but still aren't really lazy)
+* Identity provider framework and header-based authentication
+* Timeout when searching for `ReprsOf`
+* Fix resolution of some ivy/maven artifacts (thanks @JD557)
+* Fix drag-and-drop events in Firefox (thanks @JD557)
+* Support Safari (thanks @calmarj)
+* Support ivy/maven credentials as coursier credentials.properties (thanks @JD557)
+* Misc bugfixes improvements to remote kernel reliability
+
+# 0.2.13 (Nov 7, 2019)
+
+* Improve remote kernel error handling
+* Make LimitedSharingClassLoader configurable (thanks @ghoto !)
+* Remove `sun.misc.Cleaner` which is messes up JDK9+
+* Resolve insecure py4j gateway issue (thanks again, @ghoto !)
+* Fix bug in handling empty configs
+* Add ability to specify multiple storage mounts
+
+# 0.2.12 (Nov 5, 2019)
+
+* Updated notebook list UI, with ability to rename and delete notebooks (right click), navigate with keyboard, etc
+* Fixed classloading bug causing e.g. #588
+* Don't override spark.app.name if it's set in the spark config
+* Fix bug causing issues importing shared modules installed inside virtual environments
+* Publish snapshot artifacts of all modules to sonatype
 
 # 0.2.11 (October 31, 2019)
     

@@ -3,35 +3,35 @@ package polynote.kernel.dependency
 import java.io.{File, FileOutputStream}
 import java.net.URI
 import java.nio.file.{Files, Path, Paths}
-import java.util.concurrent.{ConcurrentHashMap, ExecutorService}
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
-import cats.{Applicative, Traverse}
+import cats.Traverse
 import cats.data.{Validated, ValidatedNel}
-import cats.effect.concurrent.Ref
 import cats.effect.LiftIO
-import cats.syntax.alternative._
-import cats.syntax.apply._
-import cats.syntax.either._
-import cats.syntax.traverse._
+import cats.effect.concurrent.Ref
 import cats.instances.either._
 import cats.instances.list._
+import cats.syntax.alternative._
+import cats.syntax.apply._
+import cats.syntax.traverse._
 import coursier.cache.{ArtifactError, Cache, CacheLogger, FileCache}
-import coursier.core.Repository.Fetch
-import coursier.{Artifacts, Attributes, Dependency, MavenRepository, Module, ModuleName, Organization, Repository, Resolution, Resolve}
-import coursier.core.{Artifact, Classifier, Configuration, Exclusions, Repository, Resolution, ResolutionProcess, Type}
+import coursier.core._
+import coursier.credentials.{DirectCredentials, Credentials => CoursierCredentials}
 import coursier.error.ResolutionError
 import coursier.ivy.IvyRepository
 import coursier.params.ResolutionParams
 import coursier.util.{EitherT, Sync}
-import polynote.config.{RepositoryConfig, ivy, maven}
-import polynote.kernel.{TaskInfo, TaskManager, UpdatedTasks}
-import polynote.kernel.environment.{CurrentNotebook, CurrentTask, Env}
+import coursier.{Artifacts, Attributes, Dependency, MavenRepository, Module, ModuleName, Organization, Resolve}
+import polynote.config.{RepositoryConfig, ivy, maven, Credentials => CredentialsConfig}
+import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask}
+import polynote.kernel.logging.Logging
+import polynote.kernel.task.TaskManager
 import polynote.kernel.util.{DownloadableFile, DownloadableFileProvider}
 import polynote.messages.NotebookConfig
-import zio.blocking.{Blocking, effectBlocking, blocking}
-import zio.{Task, RIO, ZIO, ZManaged}
+import zio.blocking.{Blocking, blocking, effectBlocking}
 import zio.interop.catz._
+import zio.{RIO, Task, UIO, URIO, ZIO, ZManaged}
 
 import scala.concurrent.ExecutionContext
 import scala.tools.nsc.interpreter.InputStream
@@ -39,35 +39,52 @@ import scala.tools.nsc.interpreter.InputStream
 object CoursierFetcher {
   type ArtifactTask[A] = RIO[CurrentTask, A]
   type OuterTask[A] = RIO[TaskManager with CurrentTask, A]
-  //type ArtifactTask[A] = RIO[CurrentTask, A]
 
   private val excludedOrgs = Set(Organization("org.scala-lang"), Organization("org.apache.spark"))
-  private val cache = FileCache[ArtifactTask]()
+  private val baseCache = FileCache[ArtifactTask]()
 
-  def fetch(language: String): RIO[CurrentNotebook with TaskManager with Blocking, List[(Boolean, String, File)]] = TaskManager.run("Coursier", "Dependencies", "Resolving dependencies") {
+  def fetch(language: String): RIO[Logging with Config with CurrentNotebook with TaskManager with Blocking, List[(Boolean, String, File)]] = TaskManager.run("Coursier", "Dependencies", "Resolving dependencies") {
     for {
-      config       <- CurrentNotebook.config
-      dependencies  = config.dependencies.flatMap(_.toMap.get(language)).map(_.toList).getOrElse(Nil)
-      (deps, uris)  = splitDependencies(dependencies)
-      repoConfigs   = config.repositories.map(_.toList).getOrElse(Nil)
-      exclusions    = config.exclusions.map(_.toList).getOrElse(Nil)
-      repositories <- ZIO.fromEither(repositories(repoConfigs))
-      resolution   <- resolution(deps, exclusions, repositories)
-      _            <- CurrentTask.update(_.copy(detail = "Downloading dependencies...", progress = 0))
-      downloadDeps <- download(resolution).fork
-      downloadUris <- downloadUris(uris).fork
-      downloaded   <- downloadDeps.join.map2(downloadUris.join)(_ ++ _)
+      polynoteConfig <- Config.access
+      config         <- CurrentNotebook.config
+      dependencies    = config.dependencies.flatMap(_.toMap.get(language)).map(_.toList).getOrElse(Nil)
+      splitRes       <- splitDependencies(dependencies)
+      (deps, uris)    = splitRes
+      repoConfigs     = config.repositories.map(_.toList).getOrElse(Nil)
+      exclusions      = config.exclusions.map(_.toList).getOrElse(Nil)
+      credentials    <- loadCredentials(polynoteConfig.credentials)
+      repositories   <- ZIO.fromEither(repositories(repoConfigs, credentials))
+      cache           = baseCache.addCredentials(credentials: _*)
+      resolution     <- resolution(deps, exclusions, repositories, cache)
+      _              <- CurrentTask.update(_.copy(detail = "Downloading dependencies...", progress = 0))
+      downloadDeps   <- download(resolution, cache).fork
+      downloadUris   <- downloadUris(uris).fork
+      downloaded     <- ZIO.mapN(downloadDeps.join, downloadUris.join)(_ ++ _)
     } yield downloaded
   }
 
-  private def repositories(repositories: List[RepositoryConfig]): Either[Throwable, List[Repository]] = repositories.collect {
+  private def loadCredentials(credentials: CredentialsConfig): URIO[Logging, List[DirectCredentials]] = credentials.coursier match {
+    case Some(CredentialsConfig.Coursier(path)) =>
+      Task(CoursierCredentials(new File(path), optional = false).get().toList)
+        .catchAll(err => Logging.error("Failed to load credentials", err).as(Nil))
+    case None => UIO(Nil)
+  }
+
+  private def repositories(repositories: List[RepositoryConfig], credentials: List[DirectCredentials]): Either[Throwable, List[Repository]] = repositories.collect {
     case repo @ ivy(base, _, _, changing) =>
       val baseUri = base.stripSuffix("/") + "/"
       val artifactPattern = s"$baseUri${repo.artifactPattern}"
       val metadataPattern = s"$baseUri${repo.metadataPattern}"
-      Validated.fromEither(IvyRepository.parse(artifactPattern, Some(metadataPattern), changing = changing)).toValidatedNel
+      Validated.fromEither(IvyRepository.parse(
+        artifactPattern,
+        Some(metadataPattern),
+        changing = changing
+      )).toValidatedNel
     case maven(base, changing) =>
-      val repo = MavenRepository(base, changing = changing)
+      val repo = MavenRepository(
+        base,
+        changing = changing
+      )
       Validated.validNel(repo)
   }.sequence[ValidatedNel[String, ?], Repository].leftMap {
     errs => new RuntimeException(s"Errors parsing repositories:\n- ${errs.toList.mkString("\n- ")}")
@@ -77,7 +94,8 @@ object CoursierFetcher {
   private def resolution(
     dependencies: List[String],
     exclusions: List[String],
-    repositories: List[Repository]
+    repositories: List[Repository],
+    cache: FileCache[ArtifactTask]
   ): RIO[CurrentTask, Resolution] = ZIO {
     val coursierExclude = exclusions.map { exclusionStr =>
       exclusionStr.split(":") match {
@@ -89,9 +107,9 @@ object CoursierFetcher {
     lazy val coursierDeps = dependencies.map {
       moduleStr =>
         val (org, name, typ, config, classifier, ver) = moduleStr.split(':') match {
-          case Array(org, name, ver) => (Organization(org), ModuleName(name), Type.empty, Configuration.default, Classifier.empty, ver)
-          case Array(org, name, classifier, ver) => (Organization(org), ModuleName(name), Type.empty, Configuration.default, Classifier(classifier), ver)
-          case Array(org, name, typ, classifier, ver) => (Organization(org), ModuleName(name), Type(typ), Configuration.default, Classifier(classifier), ver)
+          case Array(org, name, ver) => (Organization(org), ModuleName(name), Type.empty, Configuration.empty, Classifier.empty, ver)
+          case Array(org, name, typ, ver) => (Organization(org), ModuleName(name), Type(typ), Configuration.empty, Classifier.empty, ver)
+          case Array(org, name, typ, classifier, ver) => (Organization(org), ModuleName(name), Type(typ), Configuration.empty, Classifier(classifier), ver)
           case Array(org, name, typ, config, classifier, ver) => (Organization(org), ModuleName(name), Type(typ), Configuration(config), Classifier(classifier), ver)
           case _ => throw new Exception(s"Unable to parse dependency '$moduleStr'")
         }
@@ -146,8 +164,6 @@ object CoursierFetcher {
         }
     }
 
-
-
     Resolve(cache)
       .addDependencies(coursierDeps: _*)
       .withRepositories(repos)
@@ -159,10 +175,12 @@ object CoursierFetcher {
 
   private def download(
     resolution: Resolution,
+    cache: FileCache[ArtifactTask],
     maxIterations: Int = 100
-  ): RIO[TaskManager with CurrentTask, List[(Boolean, String, File)]] = ZIO.runtime[Any].flatMap {
+  ): RIO[Blocking with TaskManager with CurrentTask, List[(Boolean, String, File)]] = ZIO.runtime[Blocking].flatMap {
     runtime =>
-      Artifacts(new TaskManagedCache(cache, runtime.Platform.executor.asEC)).withResolution(resolution).withMainArtifacts(true).ioResult.map {
+      val blockingExecutor = runtime.environment.get.blockingExecutor.asEC
+      Artifacts(new TaskManagedCache(cache, blockingExecutor)).withResolution(resolution).withMainArtifacts(true).ioResult.map {
         artifactResult =>
           artifactResult.detailedArtifacts.toList.map {
             case (dep, pub, artifact, file) =>
@@ -187,7 +205,7 @@ object CoursierFetcher {
     def downloadToFile(file: DownloadableFile, cacheFile: File) = for {
       blockingEnv <- ZIO.access[Blocking](identity)
       task        <- CurrentTask.access
-      ec          <- blockingEnv.blocking.blockingExecutor.map(_.asEC)
+      ec           = blockingEnv.get.blockingExecutor.asEC
       size        <- blocking(LiftIO[Task].liftIO(file.size))
       _           <- ZIO(Files.createDirectories(cacheFile.toPath.getParent))
       _           <- ZManaged.fromAutoCloseable(effectBlocking(new FileOutputStream(cacheFile))).use {
@@ -208,7 +226,7 @@ object CoursierFetcher {
     } yield ()
 
     for {
-      file        <- ZIO.fromOption(DownloadableFileProvider.getFile(uri)).mapError(_ => new Exception(s"Unable to find provider for uri $uri"))
+      file        <- DownloadableFileProvider.getFile(uri)
       inputAsFile  = Paths.get(uri.getPath).toFile
       exists      <- effectBlocking(inputAsFile.exists())
       download    <- if (exists) ZIO.succeed(inputAsFile) else downloadToFile(file, localFile).as(localFile)
@@ -216,21 +234,16 @@ object CoursierFetcher {
 
   }
 
-  private def splitDependencies(deps: List[String]): (List[String], List[URI]) = {
-    val (dependencies, uriList) = deps.map { dep =>
-
-      val asURI = new URI(dep)
-
-      Either.cond(
-        // Do we support this protocol (if any?)
-        DownloadableFileProvider.isSupported(asURI),
-        asURI,
-        dep // an unsupported protocol might be a dependency
-      )
-    }.separate
-
-    (dependencies, uriList)
-  }
+  private def splitDependencies(deps: List[String]): RIO[Blocking, (List[String], List[URI])] = deps.map { dep =>
+    (for {
+      asURI <- ZIO(new URI(dep))
+      supported <- DownloadableFileProvider.isSupported(asURI)
+    } yield Either.cond(
+      test = supported,
+      right = asURI,
+      left = dep // an unsupported protocol might be a dependency coordinate (like the `foo` in `foo:bar_2.11:1.2.3`)
+    )).orElseSucceed(Left(dep)) // the URI constructor can throw
+  }.sequence.map(_.separate)
 
   protected def cacheLocation(uri: URI): Path = {
     val pathParts = Seq(uri.getScheme, uri.getAuthority, uri.getPath).flatMap(Option(_)) // URI methods sometimes return `null`, great.
@@ -240,9 +253,9 @@ object CoursierFetcher {
   // coursier doesn't have instances for ZIO built in
   implicit def zioSync[R]: Sync[RIO[R, ?]] = new Sync[RIO[R, ?]] {
     def delay[A](a: => A): RIO[R, A] = ZIO.effect(a)
-    def handle[A](a: RIO[R, A])(f: PartialFunction[Throwable, A]): RIO[R, A] = a.catchSome(f andThen ZIO.succeed)
+    def handle[A](a: RIO[R, A])(f: PartialFunction[Throwable, A]): RIO[R, A] = a.catchSome(f andThen (a => ZIO.succeed(a)))
     def fromAttempt[A](a: Either[Throwable, A]): RIO[R, A] = ZIO.fromEither(a)
-    def gather[A](elems: Seq[RIO[R, A]]): RIO[R, Seq[A]] = Traverse[List].sequence[RIO[R, ?], A](elems.toList)
+    def gather[A](elems: Seq[RIO[R, A]]): RIO[R, Seq[A]] = ZIO.collectAllParN(10)(elems)
     def point[A](a: A): RIO[R, A] = ZIO.succeed(a)
     def bind[A, B](elem: RIO[R, A])(f: A => RIO[R, B]): RIO[R, B] = elem.flatMap(f)
 

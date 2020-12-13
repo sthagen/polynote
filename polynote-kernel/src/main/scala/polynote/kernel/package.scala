@@ -1,21 +1,27 @@
 package polynote
 
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+
+import cats.effect.Concurrent
 import cats.effect.concurrent.Ref
 import fs2.Stream
 import polynote.config.PolynoteConfig
 import polynote.kernel.environment.{Config, CurrentNotebook, CurrentRuntime, CurrentTask, PublishResult, PublishStatus}
 import polynote.kernel.interpreter.Interpreter
 import polynote.kernel.logging.Logging
-import polynote.messages.Notebook
-import zio.{Task, RIO, ZIO}
-import zio.blocking.Blocking
+import polynote.kernel.task.TaskManager
+import polynote.messages.{ByteVector32, Notebook}
+import polynote.runtime.{StreamingDataRepr, TableOp}
+import scodec.bits.ByteVector
+import zio.{Has, Promise, RIO, Semaphore, Task, UIO, ZIO}
+import zio.blocking.{Blocking, effectBlocking}
 import zio.clock.Clock
 import zio.system.System
 
 package object kernel {
 
   type BaseEnv = Blocking with Clock with System with Logging
-  trait BaseEnvT extends Blocking with Clock with System with Logging
 
   // some type aliases jut to avoid env clutter
   type TaskB[+A] = RIO[BaseEnv, A]
@@ -23,23 +29,14 @@ package object kernel {
   type TaskG[+A] = RIO[BaseEnv with GlobalEnv, A]
 
   type GlobalEnv = Config with Interpreter.Factories with Kernel.Factory
-  trait GlobalEnvT extends Config with Interpreter.Factories with Kernel.Factory
-  def GlobalEnv(config: PolynoteConfig, interpFactories: Map[String, List[Interpreter.Factory]], kernelFactoryService: Kernel.Factory.Service): GlobalEnv = new GlobalEnvT {
-    val polynoteConfig: PolynoteConfig = config
-    val interpreterFactories: Map[String, List[Interpreter.Factory]] = interpFactories
-    val kernelFactory: Kernel.Factory.Service = kernelFactoryService
-  }
-
 
   // CellEnv is provided to the kernel by its host when a cell is being run
   type CellEnv = CurrentNotebook with TaskManager with PublishStatus with PublishResult
-  trait CellEnvT extends CurrentNotebook with TaskManager with PublishStatus with PublishResult
 
   // InterpreterEnv is provided to the interpreter by the Kernel when running cells
   type InterpreterEnv = Blocking with PublishResult with PublishStatus with CurrentTask with CurrentRuntime
-  trait InterpreterEnvT extends Blocking with PublishResult with PublishStatus with CurrentTask with CurrentRuntime
 
-  implicit class StreamOps[R, A](val stream: Stream[RIO[R, ?], A]) {
+  final implicit class StreamThrowableOps[R, A](val stream: Stream[RIO[R, ?], A]) {
 
     /**
       * Convenience method to terminate (rather than interrupt) a stream after a given predicate is met. In contrast to
@@ -51,31 +48,19 @@ package object kernel {
       case notEnd         => Stream.emit(Some(notEnd))
     }.unNoneTerminate
 
+    def terminateAfterEquals(value: A): Stream[RIO[R, ?], A] = terminateAfter(_ == value)
+
+    def interruptAndIgnoreWhen(signal: Promise[Throwable, Unit])(implicit concurrent: Concurrent[RIO[R, ?]]): Stream[RIO[R, ?], A] =
+      stream.interruptWhen(signal.await.either.as(Right(()): Either[Throwable, Unit]))
+
+    def terminateWhen[E <: Throwable, A1](signal: Promise[E, A1])(implicit concurrent: Concurrent[RIO[R, ?]]): Stream[RIO[R, ?], A] =
+      Stream(stream.map(Some(_)), Stream.eval(signal.await: RIO[R, A1]).map(_ => None)).parJoinUnbounded.unNoneTerminate
   }
 
-  // some tuple syntax that ZIO doesn't natively have
-  // PR for including this in ZIO: https://github.com/zio/zio/pull/1444
-  final implicit class ZIOTuple4[E, RA, A, RB, B, RC, C, RD, D](
-    val zios4: (ZIO[RA, E, A], ZIO[RB, E, B], ZIO[RC, E, C], ZIO[RD, E, D])
-  ) extends AnyVal {
-    def map4[F](f: (A, B, C, D) => F): ZIO[RA with RB with RC with RD, E, F] =
-      for {
-        a <- zios4._1
-        b <- zios4._2
-        c <- zios4._3
-        d <- zios4._4
-      } yield f(a, b, c, d)
-  }
+  final implicit class StreamUIOps[A](val stream: Stream[UIO, A]) {
 
-  final implicit class ZIOTuple3[E, RA, A, RB, B, RC, C](
-    val zios3: (ZIO[RA, E, A], ZIO[RB, E, B], ZIO[RC, E, C])
-  ) extends AnyVal {
-    def map3[F](f: (A, B, C) => F): ZIO[RA with RB with RC, E, F] =
-      for {
-        a <- zios3._1
-        b <- zios3._2
-        c <- zios3._3
-      } yield f(a, b, c)
+    def interruptAndIgnoreWhen(signal: Promise[Throwable, Unit])(implicit concurrent: Concurrent[UIO]): Stream[UIO, A] =
+      stream.interruptWhen(signal.await.either.as(Right(()): Either[Throwable, Unit]))
   }
 
   /**
@@ -83,19 +68,6 @@ package object kernel {
     */
   final implicit class ZIOOptionSyntax[R, A](val self: ZIO[R, Unit, A]) extends AnyVal {
     def withFilter(predicate: A => Boolean): ZIO[R, Unit, A] = self.filterOrFail(predicate)(())
-  }
-
-  // TODO: flesh this out and use it instead of that ^^ so we don't have to throw away errors for optionality
-  final case class OptionT[-R, +E, +A](run: ZIO[R, Either[E, Unit], Option[A]]) extends AnyVal {
-    def filter(predicate: A => Boolean): OptionT[R, E, A] = copy(run.filterOrFail(_.exists(predicate))(Right(())))
-    def map[B](fn: A => B): OptionT[R, E, B] = copy(run.map(_.map(fn)))
-    def flatMap[R1 <: R, E1 >: E, B](fn: A => OptionT[R1, E1, B]): OptionT[R1, E1, B] = {
-      val next = run.flatMap {
-        case None => ZIO.fail(Right(()))
-        case Some(a) => fn(a).run
-      }
-      copy(next)
-    }
   }
 
   /**
@@ -107,6 +79,11 @@ package object kernel {
 
   final implicit class RIOSyntax[R, A](val self: ZIO[R, Throwable, A]) extends AnyVal {
     def withFilter(predicate: A => Boolean): ZIO[R, Throwable, A] = self.filterOrFail(predicate)(new MatchError("Predicate is not satisfied"))
+  }
+
+  def effectMemoize[A](thunk: => A): Task[A] = {
+    lazy val a = thunk
+    ZIO(a)
   }
 
   def withContextClassLoaderIO[A](cl: ClassLoader)(thunk: => A): RIO[Blocking, A] =
@@ -121,5 +98,95 @@ package object kernel {
     }
   }
 
+  type StreamingHandles = Has[StreamingHandles.Service]
+
+
+  object StreamingHandles {
+    trait Service {
+      def getStreamData(handleId: Int, count: Int): TaskB[Array[ByteVector32]]
+      def modifyStream(handleId: Int, ops: List[TableOp]): TaskB[Option[StreamingDataRepr]]
+      def releaseStreamHandle(handleId: Int): TaskB[Unit]
+      def sessionID: Int
+    }
+
+    object Service {
+      def make(sessionID: Int): Task[Service] = Semaphore.make(1).map {
+        semaphore => new Impl(semaphore, sessionID)
+      }
+
+      class Impl(semaphore: Semaphore, val sessionID: Int) extends Service  {
+        // hold a reference to modified streaming reprs until they're consumed, otherwise they'll get GCed before they can get used
+        private val modifiedStreams = new ConcurrentHashMap[Int, StreamingDataRepr]()
+
+        // currently running stream iterators
+        private val streams = new ConcurrentHashMap[Int, HandleIterator]
+
+        private def takeElems(iter: HandleIterator, count: Int) =
+          effectBlocking(iter.take(count).toArray).onError(_ => ZIO(modifiedStreams.remove(iter.handleId)).ignore)
+
+        override def getStreamData(handleId: Int, count: Int): TaskB[Array[ByteVector32]] =
+          Option(streams.get(handleId)) match {
+            case Some(iter) => takeElems(iter, count)
+            case None => semaphore.withPermit {
+              ZIO(Option(streams.get(handleId))).flatMap {
+                case Some(iter) => effectBlocking(iter.take(count).toArray)
+                case None => for {
+                  handle     <- ZIO.effectTotal(StreamingDataRepr.getHandle(handleId)).get.mapError(_ => new NoSuchElementException(s"Invalid streaming handle ID $handleId"))
+                    iter       <- effectBlocking(handle.iterator)
+                    handleIter  = new HandleIterator(handleId, handle.iterator.map(buf => ByteVector32(ByteVector(buf.rewind().asInstanceOf[ByteBuffer]))))
+                    _          <- ZIO.effectTotal(streams.put(handleId, handleIter))
+                    arr        <- takeElems(handleIter, count)
+                } yield arr
+              }
+            }
+          }
+
+        override def releaseStreamHandle(handleId: Int): Task[Unit] = ZIO.effectTotal(streams.remove(handleId)).unit
+
+        override def modifyStream(handleId: Int, ops: List[TableOp]): TaskB[Option[StreamingDataRepr]] = {
+          ZIO(StreamingDataRepr.getHandle(handleId)).flatMap {
+            case None => ZIO.succeed(None)
+            case Some(handle) =>
+              ZIO.fromEither(handle.modify(ops))
+                .map(StreamingDataRepr.fromHandle).map(Some(_))
+                .catchSome {
+                  case err: UnsupportedOperationException => ZIO.succeed(None)
+                }.tap {
+                case Some(handle) => ZIO(modifiedStreams.put(handle.handle, handle))
+                case None => ZIO.unit
+              }.tapError(Logging.error("Error modifying streaming handle", _))
+          }
+        }
+
+        private class HandleIterator(val handleId: Int, iter: Iterator[ByteVector32]) extends Iterator[ByteVector32] {
+          override def hasNext: Boolean = {
+            val hasNext = iter.hasNext
+            if (!hasNext) {
+              streams.remove(handleId) // release this iterator for GC to make underlying collection available for GC
+              modifiedStreams.remove(handleId) // if it was a modified stream, release that reference as well
+            }
+            hasNext
+          }
+
+          override def next(): ByteVector32 = iter.next()
+        }
+
+      }
+    }
+
+    def make(sessionID: Int): TaskB[Service] = Service.make(sessionID)
+
+    def access: RIO[StreamingHandles, StreamingHandles.Service] = ZIO.access[StreamingHandles](_.get)
+
+    def getStreamData(handleId: Int, count: Int): RIO[BaseEnv with StreamingHandles, Array[ByteVector32]] =
+      access.flatMap(_.getStreamData(handleId, count))
+
+    def modifyStream(handleId: Int, ops: List[TableOp]): RIO[BaseEnv with StreamingHandles, Option[StreamingDataRepr]] =
+      access.flatMap(_.modifyStream(handleId, ops))
+
+    def releaseStreamHandle(handleId: Int): RIO[BaseEnv with StreamingHandles, Unit] =
+      access.flatMap(_.releaseStreamHandle(handleId))
+
+  }
 
 }

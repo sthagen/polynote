@@ -21,14 +21,30 @@
 #  host: 127.0.0.1
 #  port: 8192
 
+###############################################################################
+# Security settings. Be careful with these!
+###############################################################################
+
+#security:
+#  websocket_key: only_for_testing
+
 
 ############################################################################################
 # Storage-related configuration. Locations are all relative to Polynote's working directory.
 ############################################################################################
 
 #storage:
-#  # The location Polynote looks for your notebooks in
+#  # The base directory Polynote should use when looking for notebooks. This location can be absolute or
+#  # relative to Polynote's working directory.
 #  dir: notebooks
+#  # These are additional mount points. Folders specified here will be 'mounted' into the base directory
+#  # and visible by their keys - so `foo: dir: bar` will show a folder `foo` in the UI that shows the contents of the
+#  # file system under `bar/`
+#  mounts:
+#    examples:
+#      dir: examples
+#    team_notebooks:
+#      dir: /shared/notebooks
 #  # The location Polynote puts various caches, such as virtual environments created for your notebooks.
 #  cache: tmp
 
@@ -39,6 +55,8 @@
 #behavior:
 #  dependency_isolation: false
 #  kernel_isolation: always
+#  shared_packages:
+#    - com.esoteric.kryo
 
 ########## Notebook Creation Configuration #######################################################
 ###
@@ -100,13 +118,28 @@
 ###
 ###################################################################################################################
 
-#################################################################################
+###################################################################################################################
 # Spark config params can be set by uncommenting and editing the following lines.
+# To add additional spark configuration properties, add them as keys under `properties`.
+# To set additional arguments to `spark-submit`, you can use the `spark_submit_args` property.
+#
+# By default, not all jars in SPARK_DIST_CLASSPATH are available to the Polynote compiler (i.e., to user-code
+# inside cells). To use these jars (for example, if you want to use Hadoop APIs in your notebook without adding
+# a Hadoop dependency), set the `dist_classpath_filter` to a valid regular expression that selects which JARs
+# you want to use (there can be a huge number of JARs in SPARK_DIST_CLASSPATH, so it would be burdensome to
+# include all of them by default.)
+#
 #################################################################################
 
 #spark:
-#  spark.driver.userClasspathFirst: true
-#  spark.executor.userClasspathFirst: true
+#  properties:
+#    spark.driver.memory: 28g
+#    spark.executor.memory: 60g
+#    spark.driver.userClasspathFirst: true
+#    spark.executor.userClasspathFirst: true
+#  spark_submit_args: "--some --arguments"
+#  dist_classpath_filter: hadoop.*\.jar
+
 
 ########## Front-end Configuration ################################################################################
 ###
@@ -119,3 +152,18 @@
 #  # The URI relative to the server host where Polynote is mounted. You can edit this if mounting Polynote at a
 #  # different location behind a reverse proxy. This value is placed in the <base> tag.
 #  base_uri: /
+
+############################################################################################
+# Credentials. This list contains the list of credentials used to access the repositories
+############################################################################################
+
+#credentials:
+#  coursier:
+#    path: ~/.config/coursier/credentials.properties
+
+#############################################################################################################
+# Environment variables. This map gets merged with the notebook config's environment variable map at runtime.
+#############################################################################################################
+
+#env:
+#  foo: bar

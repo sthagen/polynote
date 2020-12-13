@@ -37,6 +37,8 @@ package object messages {
   implicit def truncateShortString(str: String): ShortString = ShortString(
     if (str.length > Short.MaxValue) str.substring(0, Short.MaxValue) else str)
 
+  implicit def optionShortString(o: Option[String]): Option[ShortString] = o.map(ShortString)
+
   implicit val shortStringCodec: Codec[ShortString] =
     variableSizeBytes(uint16, string(StandardCharsets.UTF_8)).xmap(ShortString, x => x)
 
@@ -46,12 +48,15 @@ package object messages {
   type ShortList[A] = List[A] @@ ShortTag
   object ShortList {
     def apply[A](list: List[A]): ShortList[A] =
-      if (list.size > Short.MaxValue)
+      if (list != null && list.size > Short.MaxValue)
         throw new RuntimeException("List length exceeds Short.MaxValue")
       else
         list.asInstanceOf[ShortList[A]]
 
+    def fromRight[A](list: List[A]): ShortList[A] = list.takeRight(Short.MaxValue).asInstanceOf[ShortList[A]]
     def of[A](elems: A*): ShortList[A] = apply(elems.toList)
+    val Nil: ShortList[Nothing] = apply(List.empty)
+    def empty[A]: ShortList[A] = ShortList(List.empty[A])
   }
 
   implicit def shortListCodec[A](implicit ca: Lazy[Codec[A]]): Codec[ShortList[A]] =
@@ -60,7 +65,7 @@ package object messages {
   implicit def shortListEncoder[A](implicit listEncoder: Encoder[List[A]]): Encoder[ShortList[A]] = listEncoder.contramap(l => l)
   implicit def shortListDecoder[A](implicit listDecoder: Decoder[List[A]]): Decoder[ShortList[A]] = listDecoder.map(l => ShortList(l))
 
-  implicit def listString2ShortListTinyString(ls: List[String]): TinyList[TinyString] = TinyList(ls.map(TinyString(_)))
+  implicit def truncateShortList[T](list: List[T]): ShortList[T] = ShortList(list.take(Short.MaxValue))
 
   trait TinyTag // denotes that the value is expected to be < 256 elements in length
 
@@ -104,6 +109,8 @@ package object messages {
   
   implicit def tinyListEncoder[A](implicit listEncoder: Encoder[List[A]]): Encoder[TinyList[A]] = listEncoder.contramap(l => l)
   implicit def tinyListDecoder[A](implicit listDecoder: Decoder[List[A]]): Decoder[TinyList[A]] = listDecoder.map(l => TinyList(l))
+
+  implicit def listString2TinyListTinyString(ls: List[String]): TinyList[TinyString] = TinyList(ls.map(TinyString(_)))
 
   type TinyMap[A, B] = Map[A, B] @@ TinyTag
   def TinyMap[A, B](map: Map[A, B]): TinyMap[A, B] = if (map.size > 255)
@@ -156,6 +163,9 @@ package object messages {
   def CellID(i: Int): CellID = i.toShort
 
   implicit def int2cellId(i: Int): CellID = i.toShort
+
+  // alias for Comment ID type
+  type CommentID = TinyString
 
   implicit def arrayCodec[A : ClassTag](implicit aCodec: Codec[A]): Codec[Array[A]] =
     int32.flatZip {

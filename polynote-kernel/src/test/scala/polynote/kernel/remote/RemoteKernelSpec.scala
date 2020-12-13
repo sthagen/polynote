@@ -1,12 +1,15 @@
 package polynote.kernel
 package remote
 
+import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 
 import org.scalamock.scalatest.MockFactory
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, FreeSpec, Matchers}
 import org.scalatestplus.scalacheck.ScalaCheckDrivenPropertyChecks
+import polynote.config.{KernelConfig, PolynoteConfig}
 import polynote.kernel.Kernel.Factory
+import polynote.kernel.RuntimeError.RecoveredException
 import polynote.kernel.environment.{NotebookUpdates, PublishResult, PublishStatus}
 import polynote.kernel.{BaseEnv, CellEnv, Completion, CompletionType, GlobalEnv, Kernel, KernelBusyState, KernelInfo, Output, ParameterHint, ParameterHints, ResultValue, Signatures, TaskInfo, UpdatedTasks}
 import polynote.kernel.logging.Logging
@@ -17,24 +20,33 @@ import polynote.testing.{Generators, ZIOSpec}
 import polynote.testing.kernel.{MockEnv, MockKernelEnv}
 import polynote.testing.kernel.remote.InProcessDeploy
 import scodec.bits.ByteVector
+import zio.blocking.effectBlocking
+import zio.duration.Duration
 import zio.{RIO, Ref, Task, ZIO}
 import zio.interop.catz._
+import zio.stream.ZStream
 
 import scala.concurrent.TimeoutException
 
-class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAndAfterAll with BeforeAndAfterEach with MockFactory with ScalaCheckDrivenPropertyChecks {
-  private val kernel        = mock[Kernel]
-  private val kernelFactory = new Factory.LocalService {
+// Base to test remote kernel with various configurations
+abstract class RemoteKernelSpecBase extends FreeSpec with Matchers with ZIOSpec with BeforeAndAfterEach with MockFactory with ScalaCheckDrivenPropertyChecks {
+  import runtime.{unsafeRun, unsafeRunSync, unsafeRunTask}
+
+  protected def config: PolynoteConfig
+  protected def label: String
+
+  protected val kernel        = mock[Kernel]
+  protected val kernelFactory = new Factory.LocalService {
     def apply(): RIO[BaseEnv with GlobalEnv with CellEnv, Kernel] = ZIO.succeed(kernel)
   }
 
-  private val env           = unsafeRun(MockKernelEnv(kernelFactory))
-  private val clientRef     = unsafeRun(Ref.make[RemoteKernelClient](null))
-  private val deploy        = new InProcessDeploy(kernelFactory, clientRef)
-  private val transport     = new SocketTransport(deploy, Some("127.0.0.1"))
-  private val remoteKernel  = unsafeRun(RemoteKernel(transport).provide(env))
+  protected val env           = unsafeRun(MockKernelEnv(kernelFactory, config))
+  protected val clientRef     = unsafeRun(Ref.make[RemoteKernelClient](null))
+  protected val deploy        = new InProcessDeploy(kernelFactory, clientRef)
+  protected val transport     = new SocketTransport(deploy)
+  protected val remoteKernel  = unsafeRun(RemoteKernel(transport).provideCustomLayer(env.baseLayer))
 
-  "RemoteKernel" - {
+  s"RemoteKernel ($label)" - {
 
     "with real networking" - {
 
@@ -46,7 +58,7 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
           PublishResult(result) *> PublishStatus(statusUpdate)
         }
 
-        unsafeRun(remoteKernel.init().provide(env))
+        unsafeRun(remoteKernel.init().provideCustomLayer(env.baseLayer))
         unsafeRun(env.publishStatus.toList) should contain(statusUpdate)
         unsafeRun(env.publishResult.toList) shouldEqual List(result)
       }
@@ -55,20 +67,20 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
         (kernel.queueCell _).expects(CellID(1)).returning {
           PublishResult(Output("text/plain", "hello")).as(ZIO.unit)
         }
-        unsafeRun(remoteKernel.queueCell(CellID(1)).provide(env).flatten)
+        unsafeRun(remoteKernel.queueCell(CellID(1)).provideCustomLayer(env.baseLayer).flatten)
         unsafeRun(env.publishResult.toList) shouldEqual List(Output("text/plain", "hello"))
       }
 
       "completionsAt" in {
         val completion = Completion("foo", Nil, TinyList.of(TinyList.of(("test", "thing"))), "resultType", CompletionType.Method)
         (kernel.completionsAt _).expects(CellID(1), 5).returning(ZIO.succeed(List(completion)))
-        unsafeRun(remoteKernel.completionsAt(CellID(1), 5).provide(env)) shouldEqual List(completion)
+        unsafeRun(remoteKernel.completionsAt(CellID(1), 5).provideCustomLayer(env.baseLayer)) shouldEqual List(completion)
       }
 
       "parametersAt" in {
         val params = Signatures(TinyList.of(ParameterHints("name", None, TinyList.of(ParameterHint("name", "typeName", None)))), 0, 1)
         (kernel.parametersAt _).expects(CellID(1), 5).returning(ZIO.succeed(Some(params)))
-        unsafeRun(remoteKernel.parametersAt(CellID(1), 5).provide(env)) shouldEqual Some(params)
+        unsafeRun(remoteKernel.parametersAt(CellID(1), 5).provideCustomLayer(env.baseLayer)) shouldEqual Some(params)
       }
 
       "status" in {
@@ -80,7 +92,7 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
       "info" in {
         val info = KernelInfo("foo" -> "bar", "baz" -> "buzz")
         (kernel.info _).expects().returning(ZIO.succeed(info))
-        unsafeRun(remoteKernel.info().provide(env)) shouldEqual info
+        unsafeRun(remoteKernel.info().provideCustomLayer(env.baseLayer)) shouldEqual info
       }
 
       "values" in {
@@ -95,7 +107,7 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
       "getHandleData" in {
         val data = ByteVector32(ByteVector(DataReprsOf.string.encode("testing")))
         (kernel.getHandleData _).expects(Streaming, 0, 1).returning(ZIO.succeed(Array(data)))
-        unsafeRun(remoteKernel.getHandleData(Streaming, 0, 1).provide(env)).toList match {
+        unsafeRun(remoteKernel.getHandleData(Streaming, 0, 1).provideCustomLayer(env.baseLayer)).toList match {
           case one :: Nil => one shouldEqual data
           case other => fail(other.toString)
         }
@@ -105,42 +117,50 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
         val ops = List(GroupAgg(List("one", "two"), List(("agg", "bagg"))))
         val newHandle = StreamingDataRepr(1, StringType, Some(2))
         (kernel.modifyStream _).expects(0, ops).returning(ZIO.succeed(Some(newHandle)))
-        unsafeRun(remoteKernel.modifyStream(0, ops).provide(env)) shouldEqual Some(newHandle)
+        unsafeRun(remoteKernel.modifyStream(0, ops).provideCustomLayer(env.baseLayer)) shouldEqual Some(newHandle)
       }
 
       "releaseHandle" in {
         (kernel.releaseHandle _).expects(Streaming, 1).returning(ZIO.unit)
-        unsafeRun(remoteKernel.releaseHandle(Streaming, 1).provide(env))
+        unsafeRun(remoteKernel.releaseHandle(Streaming, 1).provideCustomLayer(env.baseLayer))
       }
 
       "handles notebook updates" in {
-        forAll((Generators.genNotebookUpdates _).tupled(unsafeRun(env.currentNotebook.get)), MinSize(4)) {
+        val initial = unsafeRun(env.currentNotebook.getVersioned)
+        forAll((Generators.genNotebookUpdates _).tupled(initial), MinSize(4)) {
           case (finalNotebook, updates) =>
+            unsafeRun(env.currentNotebook.set(initial))
+            unsafeRun(clientRef.get.flatMap(_.notebookRef.set(initial)))
+
             whenever(updates.nonEmpty) {
               val finalVersion = updates.last.globalVersion
               updates.foreach {
                 update => unsafeRun(env.updateTopic.publish1(Some(update)))
               }
 
-              val (remoteVersion, remoteNotebook) = unsafeRun {
+              val remoteNotebook = unsafeRun {
                 clientRef.get.absorb.flatMap {
-                  client => client.notebookRef.discrete.terminateAfter(_._1 == finalVersion).compile[Task, Task, (Int, Notebook)].lastOrError
+                  client => client.notebookRef.getVersioned.repeatUntil(_._1 == finalVersion)
                 }.timeoutFail(new TimeoutException("timed out waiting for the correct notebook"))(zio.duration.Duration(2, TimeUnit.SECONDS))
               }
-              remoteNotebook shouldEqual finalNotebook
+              remoteNotebook._2 shouldEqual finalNotebook
             }
 
-            unsafeRun(clientRef.get.flatMap(_.notebookRef.set(unsafeRun(env.currentNotebook.get))))
+
+        }
+      }
+
+      "handles errors" in {
+        (kernel.info _).expects().returning(ZIO.fail(new RuntimeException("Simulated error")))
+        a[RecoveredException] should be thrownBy {
+          // unsafeRun throws a fiber failure; this way will throw the actual error
+          unsafeRunSync(remoteKernel.info().provideSomeLayer(env.baseLayer)).fold(err => throw err.squash, identity)
         }
       }
 
       "shutdown" in {
         (kernel.shutdown _).expects().returning(ZIO.unit)
-        val remoteExit = unsafeRunSync(remoteKernel.shutdown())
-        remoteExit.fold(
-          err => fail(s"Shutdown failed or was interrupted:\n${err.prettyPrint}"),
-          _ => ()
-        )
+        unsafeRunTask(remoteKernel.shutdown())
       }
     }
 
@@ -149,5 +169,51 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
   override def afterEach(): Unit = {
     env.publishResult.reset()
     env.publishStatus.reset()
+  }
+}
+
+class RemoteKernelSpec extends RemoteKernelSpecBase {
+  override protected lazy val config: PolynoteConfig = PolynoteConfig()
+  override protected lazy val label: String = "No config"
+}
+
+class RemoteKernelSpecWithPortRange extends RemoteKernelSpecBase {
+  import runtime.{unsafeRun, unsafeRunSync, unsafeRunTask}
+  override protected lazy val config: PolynoteConfig = PolynoteConfig(kernel = KernelConfig(portRange = Some(9000 to 10000)))
+  override protected lazy val label: String = "With port range"
+
+  "Gets port in correct range" in {
+    unsafeRun {
+      transport.openServerChannel.bracket(channel => ZIO.effectTotal(channel.close())) {
+        channel => ZIO.effect {
+          val port = channel.getLocalAddress.asInstanceOf[InetSocketAddress].getPort
+          assert(port >= 9000 && port <= 10000)
+        }
+      }.provideSomeLayer(env.baseLayer)
+    }
+  }
+
+  "Gets multiple ports in correct range" in {
+    val uniquePorts = new scala.collection.mutable.HashSet[Int]()
+    val numPorts = 5
+    unsafeRun {
+      ZIO.foreachPar_(0 until numPorts) { _ =>
+        transport.openServerChannel.bracket(channel => ZIO.effectTotal(channel.close())) {
+          channel =>
+            ZIO.effect(channel.getLocalAddress.asInstanceOf[InetSocketAddress].getPort).flatMap {
+              port => effectBlocking {
+                uniquePorts.synchronized {
+                  uniquePorts += port
+                }
+            }
+          } &> ZIO.sleep(Duration(1, TimeUnit.SECONDS))
+        }
+      }.provideSomeLayer(env.baseLayer)
+    }
+
+    assert(uniquePorts.size == numPorts)
+    uniquePorts.foreach {
+      port => assert(port >= 9000 && port <= 10000)
+    }
   }
 }

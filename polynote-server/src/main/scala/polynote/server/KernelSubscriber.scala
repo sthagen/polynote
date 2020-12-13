@@ -2,28 +2,54 @@ package polynote.server
 
 import java.util.concurrent.atomic.AtomicInteger
 
-import fs2.concurrent.Topic
+import fs2.concurrent.{SignallingRef, Topic}
 import fs2.Stream
-import polynote.kernel.environment.PublishMessage
-import polynote.kernel.{BaseEnv, GlobalEnv}
-import polynote.messages.{CellID, KernelStatus, Notebook, NotebookUpdate}
+import polynote.kernel.environment.{Config, PublishMessage}
+import polynote.kernel.{BaseEnv, GlobalEnv, Presence, PresenceSelection, StreamThrowableOps, StreamUIOps}
+import polynote.messages.{CellID, CreateComment, DeleteCell, DeleteComment, InsertCell, KernelStatus, Notebook, NotebookUpdate, TinyString, UpdateComment}
 import KernelPublisher.{GlobalVersion, SubscriberId}
-import zio.{Fiber, Promise, Task, RIO, ZIO}
+import polynote.kernel.logging.Logging
+import polynote.runtime.CellRange
+import polynote.server.auth.{Identity, IdentityProvider, Permission, UserIdentity}
+import zio.{Fiber, Promise, RIO, Task, UIO, URIO, ZIO}
 import zio.interop.catz._
 
 
 class KernelSubscriber private[server] (
-  id: SubscriberId,
+  val id: SubscriberId,
+  val identity: Option[Identity],
+  currentSelection: SignallingRef[UIO, Option[PresenceSelection]],
   val closed: Promise[Throwable, Unit],
   process: Fiber[Throwable, Unit],
   val publisher: KernelPublisher,
   val lastLocalVersion: AtomicInteger,
   val lastGlobalVersion: AtomicInteger
 ) {
+  lazy val presence: Presence = {
+    val (name, avatar) = identity match {
+      case Some(identity) => (identity.name, identity.avatar)
+      case None           => (s"Anonymous ($id)", None)
+    }
+    Presence(id, name, avatar.map(TinyString.apply))
+  }
 
-  def close(): Task[Unit] = closed.succeed(()).unit *> process.join
-  def update(update: NotebookUpdate): Task[Unit] = publisher.update(id, update) *> ZIO(lastLocalVersion.set(update.localVersion)) *> ZIO(lastGlobalVersion.set(update.globalVersion))
-  def notebook(): Task[Notebook] = publisher.latestVersion.map(_._2)
+  def close(): UIO[Unit] = closed.succeed(()).unit *> process.interrupt.unit
+
+  def update(update: NotebookUpdate): Task[Unit] =
+    ZIO.effectTotal(lastLocalVersion.set(update.localVersion)) *>
+      ZIO.effectTotal(lastGlobalVersion.get()).flatMap(gv => publisher.update(id, update.withVersions(gv, update.localVersion)))
+
+  def notebook: Task[Notebook] = publisher.latestVersion.map(_._2)
+  def currentPath: Task[String] = notebook.map(_.path)
+  def checkPermission(permission: String => Permission): ZIO[SessionEnv, Throwable, Unit] =
+    currentPath.map(permission) >>= IdentityProvider.checkPermission
+
+  def setSelection(cellID: CellID, range: CellRange): UIO[Unit] =
+    currentSelection.set(Some(PresenceSelection(id, cellID, range)))
+
+  def getSelection: UIO[Option[PresenceSelection]] = currentSelection.get
+
+  def selections: Stream[UIO, PresenceSelection] = currentSelection.discrete.unNone.interruptAndIgnoreWhen(closed)
 }
 
 object KernelSubscriber {
@@ -31,7 +57,7 @@ object KernelSubscriber {
   def apply(
     id: SubscriberId,
     publisher: KernelPublisher
-  ): RIO[PublishMessage, KernelSubscriber] = {
+  ): RIO[PublishMessage with UserIdentity, KernelSubscriber] = {
 
     def rebaseUpdate(update: NotebookUpdate, globalVersion: GlobalVersion, localVersion: Int) =
       publisher.versionBuffer.getRange(update.globalVersion, globalVersion)
@@ -39,30 +65,38 @@ object KernelSubscriber {
         .withVersions(globalVersion, localVersion)
 
     def foreignUpdates(local: AtomicInteger, global: AtomicInteger) =
-      publisher.broadcastUpdates.subscribe(128).unNone.filter(_._1 != id).map(_._2).map {
-        update =>
-          val knownGlobalVersion = global.get()
-          if (update.globalVersion < knownGlobalVersion) {
+      publisher.broadcastUpdates.subscribe(128).unNone.evalMap {
+        case (`id`, update) if update.echoOriginatingSubscriber =>
+          ZIO.effectTotal(global.set(update.globalVersion)).as(Some(update))
+        case (`id`, update) =>
+          ZIO.effectTotal(global.set(update.globalVersion)).as(None)
+        case (_, update)    => ZIO.effectTotal(global.get()).map {
+          case knownGlobalVersion if update.globalVersion < knownGlobalVersion =>
             Some(rebaseUpdate(update, knownGlobalVersion, local.get()))
-          } else if (update.globalVersion > knownGlobalVersion) {
+          case knownGlobalVersion if update.globalVersion > knownGlobalVersion =>
             Some(update.withVersions(update.globalVersion, local.get()))
-          } else None
+          case _ => None
+        }
       }.unNone.evalTap(_ => ZIO(local.incrementAndGet()).unit)
 
     for {
       closed           <- Promise.make[Throwable, Unit]
-      versioned        <- publisher.versionedNotebook.get
+      identity         <- UserIdentity.access
+      versioned        <- publisher.versionedNotebook.getVersioned
       (ver, notebook)   = versioned
       lastLocalVersion  = new AtomicInteger(0)
       lastGlobalVersion = new AtomicInteger(ver)
       publishMessage   <- PublishMessage.access
+      currentSelection <- SignallingRef[UIO, Option[PresenceSelection]](None)
       updater          <- Stream.emits(Seq(
           foreignUpdates(lastLocalVersion, lastGlobalVersion),
-          publisher.status.subscribe(128).tail.map(KernelStatus(notebook.path, _)),
+          publisher.status.subscribe(128).tail.filter(_.isRelevant(id)).map(update => KernelStatus(update.forSubscriber(id))),
           publisher.cellResults.subscribe(128).tail.unNone
-        )).parJoinUnbounded.interruptWhen(closed.await.either).through(publishMessage.publish).compile.drain.fork
+        )).parJoinUnbounded.interruptAndIgnoreWhen(closed).through(publishMessage.publish).compile.drain.forkDaemon
     } yield new KernelSubscriber(
       id,
+      identity,
+      currentSelection,
       closed,
       updater,
       publisher,

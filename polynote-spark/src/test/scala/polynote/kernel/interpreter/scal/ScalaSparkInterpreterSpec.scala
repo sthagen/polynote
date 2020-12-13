@@ -6,6 +6,7 @@ import org.scalatest.{FreeSpec, Matchers}
 import polynote.kernel.ScalaCompiler
 import polynote.kernel.environment.Env
 import polynote.testing.InterpreterSpec
+import zio.ZLayer
 import zio.blocking.Blocking
 
 import scala.reflect.io.{PlainDirectory, VirtualDirectory}
@@ -23,7 +24,7 @@ class ScalaSparkInterpreterSpec extends FreeSpec with InterpreterSpec with Match
     Main.createSparkSession()
   }
 
-  lazy val interpreter: ScalaInterpreter = ScalaSparkInterpreter().provideSomeM(Env.enrich[Blocking](ScalaCompiler.Provider.of(compiler))).runIO()
+  lazy val interpreter: ScalaInterpreter = ScalaSparkInterpreter().provideSomeLayer[Blocking](ZLayer.succeed(compiler)).runIO()
 
 
   "The Scala Spark Kernel" - {
@@ -149,12 +150,14 @@ class ScalaSparkInterpreterSpec extends FreeSpec with InterpreterSpec with Match
     "work with lazy vals and vars" in {
       val code = Seq(
         "var a = 100",
-        "lazy val b = a"
+        "lazy val b = a",
+        "val c = a + b"
       )
       assertOutput(code) {
         case (vars, output) =>
           vars("a") shouldEqual 100
           vars("b") shouldEqual 100
+          vars("c") shouldEqual 200
       }
     }
 

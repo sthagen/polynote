@@ -3,6 +3,7 @@ import java.io.File
 import java.nio.file.{FileSystems, Files}
 import java.util.concurrent.{Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.regex.Pattern
 
 import cats.effect.concurrent.Ref
 import cats.instances.list._
@@ -11,19 +12,20 @@ import fs2.concurrent.SignallingRef
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.SparkSession
 import polynote.buildinfo.BuildInfo
-import polynote.config.PolynoteConfig
+import polynote.config.{PolynoteConfig, SparkConfig}
 import polynote.kernel.dependency.CoursierFetcher
-import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask, Env, InterpreterEnvironment}
+import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask, Env}
 import polynote.kernel.interpreter.scal.{ScalaInterpreter, ScalaSparkInterpreter}
 import polynote.kernel.interpreter.{Interpreter, State}
 import polynote.kernel.logging.Logging
+import polynote.kernel.task.TaskManager
 import polynote.kernel.util.{RefMap, pathOf}
 import polynote.messages.{CellID, NotebookConfig, TinyList}
 import polynote.runtime.spark.reprs.SparkReprsOf
 import zio.blocking.{Blocking, effectBlocking}
 import zio.clock.Clock
 import zio.internal.Executor
-import zio.{Task, RIO, ZIO}
+import zio.{Promise, RIO, Task, ZIO, ZLayer}
 import zio.interop.catz._
 import zio.system.{env, property}
 
@@ -36,12 +38,13 @@ import scala.tools.nsc.io.Directory
 
 // TODO: this class may not even be necessary
 class LocalSparkKernel private[kernel] (
-  compilerProvider: ScalaCompiler.Provider,
+  compilerProvider: ScalaCompiler,
   sparkSession: SparkSession,
   interpreterState: Ref[Task, State],
   interpreters: RefMap[String, Interpreter],
-  busyState: SignallingRef[Task, KernelBusyState]
-) extends LocalKernel(compilerProvider, interpreterState, interpreters, busyState) {
+  busyState: SignallingRef[Task, KernelBusyState],
+  closed: Promise[Throwable, Unit]
+) extends LocalKernel(compilerProvider, interpreterState, interpreters, busyState, closed) {
 
   override def info(): TaskG[KernelInfo] = super.info().map {
     info => sparkSession.sparkContext.uiWebUrl match {
@@ -50,42 +53,61 @@ class LocalSparkKernel private[kernel] (
     }
   }
 
-  override protected def chooseInterpreterFactory(factories: List[Interpreter.Factory]): ZIO[Any, Unit, Interpreter.Factory] =
+  override protected def chooseInterpreterFactory(factories: List[Interpreter.Factory]): ZIO[Any, Option[Nothing], Interpreter.Factory] =
     ZIO.fromOption(factories.headOption)
 
 }
 
 class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
-  import LocalSparkKernel.kernelCounter
 
   // all the JARs in Spark's classpath. I don't think this is actually needed.
   private def sparkDistClasspath = env("SPARK_DIST_CLASSPATH").orDie.get.flatMap {
-    cp => cp.split(File.pathSeparator).toList.map {
-      filename =>
-        val file = new File(filename)
-        file.getName match {
-          case "*" | "*.jar" =>
-            effectBlocking {
-              if (file.getParentFile.exists())
-                Files.newDirectoryStream(file.getParentFile.toPath, file.getName).iterator().asScala.toList.map(_.toFile)
-              else
-                Nil
-            }.orDie
-          case _ =>
-            effectBlocking(if (file.exists()) List(file) else Nil).orDie
-        }
-    }.sequence.map(_.flatten)
+    cp =>
+      Config.access.flatMap {
+        config =>
+          config.spark.flatMap(_.distClasspathFilter) match {
+            case None => ZIO.succeed(Nil)
+            case Some(pattern) =>
+              cp.split(File.pathSeparator).toList.map {
+                filepath =>
+                  val file = new File(filepath)
+                  file.getName match {
+                    case "*" | "*.jar" =>
+                      effectBlocking {
+                        if (file.getParentFile.exists())
+                          Files.newDirectoryStream(file.getParentFile.toPath, file.getName).iterator().asScala.toList.map(_.toFile)
+                        else
+                          Nil
+                      }.orDie
+                    case _ =>
+                      effectBlocking(if (file.exists()) List(file) else Nil).orDie
+                  }
+              }.sequence.map(_.flatten).map {
+                expandedFiles =>
+                  val reg = pattern.asPredicate()
+                  expandedFiles.filter(path => reg.test(path.getAbsolutePath) && path.getAbsolutePath.endsWith(".jar"))
+              }.tap {
+                extraJars =>
+                  if (extraJars.nonEmpty) {
+                    Logging.info(s"Adding these paths from SPARK_DIST_CLASSPATH: $extraJars")
+                  } else ZIO.unit
+              }
+          }
+      }
   }
 
   private def sparkClasspath = env("SPARK_HOME").orDie.get.flatMap {
     sparkHome =>
-      effectBlocking {
-        val homeFile = new File(sparkHome)
-        if (homeFile.exists()) {
-          val jarsPath = homeFile.toPath.resolve("jars")
-          Files.newDirectoryStream(jarsPath, "*.jar").iterator().asScala.toList.map(_.toFile)
-        } else Nil
-      }.orDie
+      for {
+        fromSparkDist <- sparkDistClasspath
+        fromSparkJars <- effectBlocking {
+          val homeFile = new File(sparkHome)
+          if (homeFile.exists()) {
+            val jarsPath = homeFile.toPath.resolve("jars")
+            Files.newDirectoryStream(jarsPath, "*.jar").iterator().asScala.toList.map(_.toFile)
+          } else Nil
+        }.orDie
+      } yield fromSparkDist ++ fromSparkJars
   }
 
   private def systemClasspath =
@@ -104,15 +126,15 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
     sparkClasspath   <- (sparkClasspath orElse systemClasspath).option.map(_.getOrElse(Nil))
     _                <- Logging.info(s"Using spark classpath: ${sparkClasspath.mkString(":")}")
     sparkJars         = (sparkRuntimeJar :: ScalaCompiler.requiredPolynotePaths).map(f => f.toString -> f) ::: scalaDeps.map { case (_, uri, file) => (uri, file) }
-    compiler         <- ScalaCompiler.provider(main.map(_._3), sparkRuntimeJar :: transitive.map(_._3) ::: sparkClasspath, updateSettings)
-    classLoader      <- compiler.scalaCompiler.classLoader
+    compiler         <- ScalaCompiler(main.map(_._3), sparkRuntimeJar :: transitive.map(_._3), sparkClasspath, updateSettings)
+    classLoader       = compiler.classLoader
     session          <- startSparkSession(sparkJars, classLoader)
-    notebookPackage   = s"$$notebook$$${kernelCounter.getAndIncrement()}"
     busyState        <- SignallingRef[Task, KernelBusyState](KernelBusyState(busy = true, alive = true))
     interpreters     <- RefMap.empty[String, Interpreter]
-    scalaInterpreter <- interpreters.getOrCreate("scala")(ScalaSparkInterpreter().provideSomeM(Env.enrich[Blocking](compiler)))
+    scalaInterpreter <- interpreters.getOrCreate("scala")(ScalaSparkInterpreter().provideSomeLayer[Blocking](ZLayer.succeed(compiler)))
     interpState      <- Ref[Task].of[State](State.predef(State.Root, State.Root))
-  } yield new LocalSparkKernel(compiler, session, interpState, interpreters, busyState)
+    closed           <- Promise.make[Throwable, Unit]
+  } yield new LocalSparkKernel(compiler, session, interpState, interpreters, busyState, closed)
 
   private def startSparkSession(deps: List[(String, File)], classLoader: ClassLoader): RIO[BaseEnv with GlobalEnv with CellEnv, SparkSession] = {
 
@@ -140,7 +162,8 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
     }
 
     def mkSpark(
-      sparkConfig: Map[String, String]
+      sparkConfig: Map[String, String],
+      notebookPath: String
     ): RIO[Blocking with Config with Logging, SparkSession] = ZIO {
       val outputPath = org.apache.spark.repl.Main.outputDir.toPath
       val conf = org.apache.spark.repl.Main.conf
@@ -157,7 +180,7 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
       conf
         .setJars(jars)
         .set("spark.repl.class.outputDir", outputPath.toString)
-        .setAppName(s"Polynote ${BuildInfo.version} session")
+        .setIfMissing("spark.app.name", s"Polynote ${BuildInfo.version}: $notebookPath")
 
       org.apache.spark.repl.Main.createSparkSession()
     }
@@ -187,8 +210,9 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
       for {
         config         <- Config.access
         notebookConfig <- CurrentNotebook.config
+        path           <- CurrentNotebook.path
         executor       <- mkExecutor()
-        session        <- mkSpark(config.spark ++ notebookConfig.sparkConfig.getOrElse(Map.empty)).lock(executor)
+        session        <- mkSpark(config.spark.map(SparkConfig.toMap).getOrElse(Map.empty) ++ notebookConfig.sparkConfig.getOrElse(Map.empty), path).lock(executor)
         _              <- ensureJars(session).lock(executor)
         _              <- ZIO(SparkEnv.get.serializer.setDefaultClassLoader(classLoader)).lock(executor)
         _              <- attachListener(session)
@@ -197,6 +221,4 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
   }
 }
 
-object LocalSparkKernel extends LocalSparkKernelFactory {
-  private[kernel] val kernelCounter = new AtomicInteger(0)
-}
+object LocalSparkKernel extends LocalSparkKernelFactory

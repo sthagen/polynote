@@ -10,8 +10,8 @@ import scodec.codecs.implicits._
 import shapeless.cachedImplicit
 import io.circe.{Decoder, Encoder}
 import io.circe.generic.semiauto.{deriveDecoder, deriveEncoder}
-import polynote.messages.{CellID, TinyList, TinyString, iorCodec, tinyListCodec, tinyStringCodec, truncateTinyString}
-import polynote.runtime.ValueRepr
+import polynote.messages.{CellID, NotebookCell, ShortList, TinyList, TinyString, iorCodec, tinyListCodec, tinyStringCodec, truncateTinyString}
+import polynote.runtime.{CellRange, ValueRepr}
 import scodec.bits.BitVector
 
 import scala.collection.mutable.ListBuffer
@@ -22,8 +22,28 @@ sealed abstract class ResultCompanion[T <: Result](msgId: Byte) {
   implicit val discriminator: Discriminator[Result, T, Byte] = Discriminator(msgId)
 }
 
-final case class Output(contentType: String, content: String) extends Result
+final case class Output(contentType: String, content: Vector[String]) extends Result
 object Output extends ResultCompanion[Output](0) {
+  def split(str: String): Vector[String] = {
+    var start = 0
+    var pos = 0
+    val len = str.length()
+    var result = Vector.empty[String]
+    while (pos < len) {
+      if (str.charAt(pos) == '\n') {
+        result = result :+ str.substring(start, pos + 1)
+        start = pos + 1
+      }
+      pos += 1
+    }
+    if (pos > start) {
+      result = result :+ str.substring(start, pos)
+    }
+    result
+  }
+
+  def apply(contentType: String, content: String): Output = Output(contentType, split(content))
+
   def parseContentType(contentType: String): (String, Map[String, String]) = contentType.split(';').toList match {
     case Nil => ("", Map.empty)
     case mime :: Nil  => mime -> Map.empty
@@ -38,6 +58,8 @@ object Output extends ResultCompanion[Output](0) {
       }
     }.toMap
   }
+
+
 }
 
 final case class CompileErrors(
@@ -155,7 +177,7 @@ final case class ResultValue(
   sourceCell: CellID,
   value: Any,
   scalaType: Universe#Type,
-  pos: Option[(Int, Int)]
+  pos: Option[CellRange]
 ) extends Result {
 
   def isCellResult: Boolean = name == "Out"
@@ -181,9 +203,42 @@ object ExecutionInfo extends ResultCompanion[ExecutionInfo](5) {
 }
 
 
-sealed trait Result
+sealed trait Result {
+  def toCellUpdate: NotebookCell => NotebookCell = Result.toCellUpdate(this)
+}
 
 object Result {
   implicit val discriminated: Discriminated[Result, Byte] = Discriminated(byte)
   implicit val codec: Codec[Result] = cachedImplicit
+
+  def toCellUpdate(result: Result): NotebookCell => NotebookCell = {
+    // process carriage returns in the line – a carriage return deletes anything before it in the line, unless
+    // it's the last character before the linefeed (which must be the final character)
+    def collapseCrs(line: String): String = line.lastIndexOf('\r', line.length - 3) match {
+      case -1 => line
+      case n  => line.drop(n + 1)
+    }
+
+    result match {
+      case ClearResults() => _.copy(results = ShortList(Nil))
+      case execInfo@ExecutionInfo(_, _) => cell => cell.copy(results = ShortList(cell.results :+ execInfo), metadata = cell.metadata.copy(executionInfo = Some(execInfo)))
+      case Output("text/plain; rel=stdout", lines) if lines.nonEmpty =>
+        val processedTail = lines.tail.map(collapseCrs)
+
+        cell => {
+          val updatedResults = cell.results.lastOption match {
+            case Some(Output("text/plain; rel=stdout", linesPrev)) =>
+              val combinedLines = if (linesPrev.nonEmpty && !linesPrev.last.endsWith("\n")) {
+                linesPrev.dropRight(1) ++ (collapseCrs(linesPrev.last + lines.head) +: processedTail)
+              } else {
+                linesPrev ++ (collapseCrs(lines.head) +: processedTail)
+              }
+              cell.results.dropRight(1) :+ Output("text/plain; rel=stdout", combinedLines)
+            case _ => cell.results :+ result
+          }
+          cell.copy(results = ShortList.fromRight(updatedResults))
+        }
+      case result => cell => cell.copy(results = ShortList.fromRight(cell.results :+ result))
+    }
+  }
 }

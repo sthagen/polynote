@@ -2,6 +2,7 @@ package polynote.kernel
 
 import java.io.File
 import java.net.URL
+import java.util.concurrent.atomic.AtomicInteger
 
 import cats.syntax.traverse._
 import cats.instances.list._
@@ -10,7 +11,7 @@ import polynote.kernel.util.{KernelReporter, LimitedSharingClassLoader, pathOf}
 import zio.blocking.Blocking
 import zio.system.{System, env}
 import zio.internal.{ExecutionMetrics, Executor}
-import zio.{Task, RIO, ZIO}
+import zio.{Has, RIO, Task, UIO, ZIO}
 import zio.interop.catz._
 
 import scala.collection.mutable
@@ -18,13 +19,14 @@ import scala.reflect.internal.util.{AbstractFileClassLoader, NoSourceFile, Posit
 import scala.reflect.io.VirtualDirectory
 import scala.reflect.runtime.universe
 import scala.tools.nsc.Settings
-import scala.tools.nsc.interactive.Global
+import scala.tools.nsc.interactive.{Global, NscThief}
 import scala.reflect.internal.util.ScalaClassLoader.URLClassLoader
+import ScalaCompiler.OriginalPos
 
 class ScalaCompiler private (
   val global: Global,
   val notebookPackage: String,
-  val classLoader: Task[AbstractFileClassLoader],
+  val classLoader: AbstractFileClassLoader,
   val dependencies: List[File],
   val otherClasspath: List[File]
 ) {
@@ -68,11 +70,16 @@ class ScalaCompiler private (
       }
   }
 
+  private object saveOriginalPos extends Traverser {
+    override def traverse(tree: Tree): Unit = {
+      tree.updateAttachment(OriginalPos(tree.pos))
+      super.traverse(tree)
+    }
+  }
+
   private[kernel] def unsafeFormatType(typ: Type): String = formatTypeInternal(typ)
 
-  private val runtimeMirror = ZIO.accessM[ClassLoader](cl => ZIO(scala.reflect.runtime.universe.runtimeMirror(cl)))
-    .memoize.flatten
-    .provideSomeM(classLoader)
+  private val runtimeMirror = effectMemoize(scala.reflect.runtime.universe.runtimeMirror(classLoader))
 
   private val importer: global.Importer { val from: scala.reflect.runtime.universe.type } = global.mkImporter(scala.reflect.runtime.universe)
 
@@ -95,8 +102,7 @@ class ScalaCompiler private (
     for {
       compiled  <- cellCode.compile()
       className  = s"${packageName.encodedName.toString}.${cellCode.assignedTypeName.encodedName.toString}"
-      cl        <- classLoader
-      loadClass  = zio.blocking.effectBlocking(Option(Class.forName(className, false, cl).asInstanceOf[Class[AnyRef]]))
+      loadClass  = zio.blocking.effectBlocking(Option(Class.forName(className, false, classLoader).asInstanceOf[Class[AnyRef]]))
       cls       <- if (cellCode.cellClassSymbol.nonEmpty) loadClass else ZIO.succeed(None)
     } yield cls
 
@@ -178,7 +184,14 @@ class ScalaCompiler private (
     List(treeBuilder.scalaDot(typeNames.AnyRef)), noSelfType, stats
   )
 
-  private def template(stats: Tree*): Template = template(stats.toList)
+  // the default implementation of atPos does some additional junk that messes up things (and isn't threadsafe or nesting-safe)
+  private def atPos[T <: Tree](pos: Position)(tree: T): T = {
+    if (tree.pos == null || !tree.pos.isDefined) {
+      tree.setPos(pos)
+    }
+    tree.children.foreach(atPos(tree.pos))
+    tree
+  }
 
   case class CellCode private[ScalaCompiler] (
     name: String,
@@ -189,10 +202,19 @@ class ScalaCompiler private (
     compilationUnit: RichCompilationUnit = new global.RichCompilationUnit(NoSourceFile),
     sourceFile: SourceFile = NoSourceFile
   ) {
+
     // this copy of the code will be mutated by compile
-    lazy val compiledCode: List[Tree] = code.map {
-      stat => stat.duplicate.setPos(stat.pos)
-    }
+    lazy val compiledCode: List[Tree] = code.foldLeft(List.empty[Tree]) {
+      (accum, stat) =>
+        val copied = duplicateAndKeepPositions(stat)
+        if (copied.pos != null && copied.pos.isDefined) {
+          saveOriginalPos.traverse(copied)
+        } else {
+          val pos = accum.headOption.map(_.pos.focusEnd.makeTransparent).getOrElse(beforePos.makeTransparent)
+          atPos(pos)(copied)
+        }
+        copied :: accum
+    }.reverse
 
 
     // The name of the class (and its companion object, in case one is needed)
@@ -216,7 +238,13 @@ class ScalaCompiler private (
     lazy val (implicitInputs: List[ValDef], nonImplicitInputs: List[ValDef]) = typedInputs.partition(_.mods.isImplicit)
 
     // a position to encompass the whole synthetic tree
-    private lazy val wrappedPos = Position.transparent(sourceFile, 0, 0, sourceFile.length + 1)
+    private val end = math.max(0, sourceFile.length - 1)
+    private lazy val wrappedPos = Position.range(sourceFile, 0, 0, end)
+
+    // positions for imports mustn't be transparent, or they won't be added to context
+    // so we should try to place everything at opaque positions
+    private lazy val beforePos = Position.range(sourceFile, 0, 0, 0)
+    private lazy val afterPos = Position.range(sourceFile, end, end, end)
 
     // create imports for all types and methods defined by previous cells
     lazy val priorCellImports: List[Import] = priorCells.zip(priorCellInputs).foldLeft(Map.empty[String, (TermName, Name)]) {
@@ -235,7 +263,7 @@ class ScalaCompiler private (
 
     // what output values does this code define?
     lazy val outputs: List[ValDef] = code.collect {
-      case valDef: ValDef if valDef.mods.isPublic => valDef.duplicate
+      case valDef: ValDef if valDef.mods.isPublic => duplicateAndKeepPositions(valDef).asInstanceOf[ValDef]
     }
 
     lazy val typedOutputs: List[ValDef] = {
@@ -291,13 +319,12 @@ class ScalaCompiler private (
       }
     }
 
-    lazy val typedMethods: List[MethodSymbol] = compiledCode.collect {
-      case method: DefDef if method.mods.isPublic && method.symbol != NoSymbol && method.symbol != null && method.symbol.isMethod =>
-        method.symbol.asMethod
-    }
-
     // what things does this code import?
     lazy val imports: List[Import] = code.collect {
+      case i: Import => i.duplicate
+    }
+
+    lazy val compiledImports: List[Import] = compiledCode.collect {
       case i: Import => i.duplicate
     }
 
@@ -309,28 +336,48 @@ class ScalaCompiler private (
       case DefDef(mods, name, _, _, _, _) if mods.isPublic => name
     }.distinct
 
+    lazy val wrappedImports = copyAndReset(inheritedImports.externalImports) ++ copyAndReset(inheritedImports.localImports)
+
     // The code all wrapped up in a class definition, with constructor arguments for the given prior cells and inputs
     private lazy val wrappedClass: ClassDef = {
-      val priorCellParamList = copyAndReset(priorCellInputs)
-      val nonImplicitParamList = copyAndReset(nonImplicitInputs)
-      val implicitParamList = copyAndReset(implicitInputs)
-      q"""
-        final class $assignedTypeName(..$priorCellParamList)(..$nonImplicitParamList)(..$implicitParamList) extends scala.Serializable {
-          ..${priorCellImports}
-          ..${copyAndReset(inheritedImports.externalImports)}
-          ..${copyAndReset(inheritedImports.localImports)}
-          ..${compiledCode}
-        }
-      """
+      val transparentBefore = beforePos.makeTransparent
+
+      def toParam(param: ValDef) = atPos(transparentBefore)(param.copy(mods = param.mods | Flag.PARAMACCESSOR))
+      val priorCellParamList = copyAndReset(priorCellInputs).map(toParam)
+      val nonImplicitParamList = copyAndReset(nonImplicitInputs).map(toParam)
+      val implicitParamList = copyAndReset(implicitInputs).map(toParam)
+
+      // have to do this manually rather than with a quasiquote; latter messes up positions
+      val cls = gen.mkClassDef(
+        Modifiers(),
+        assignedTypeName,
+        Nil,
+        gen.mkTemplate(
+          List(atPos(transparentBefore)(gen.scalaDot(tpnme.Serializable))),
+          noSelfType.setPos(transparentBefore),
+          Modifiers(),
+          List(priorCellParamList, nonImplicitParamList, implicitParamList).filter(_.nonEmpty),
+          (priorCellImports ++ wrappedImports).map(atPos(beforePos.makeTransparent)) ++ compiledCode,
+          wrappedPos
+        )).setPos(wrappedPos)
+
+      /*
+        // equivalent tree:
+          q"""final class $assignedTypeName(..$priorCellParamList)(..$nonImplicitParamList)(..$implicitParamList) extends ${atPos(transparentBefore)(gen.scalaDot(tpnme.Serializable))} {
+            ..${priorCellImports.map(atPos(beforePos))}
+            ..${wrappedImports.map(atPos(beforePos))}
+            ..${compiledCode}
+          }""".setPos(wrappedPos)
+       */
+
+      cls
     }
 
     private lazy val companion: ModuleDef = {
-      q"""
-         object $assignedTermName extends {
+      q"""object $assignedTermName extends {
            final val instance: $assignedTypeName = null
            type Inst = instance.type
-         }
-       """
+         }"""
     }
 
     // Wrap the code in a class within the given package. Constructing the class runs the code.
@@ -338,12 +385,10 @@ class ScalaCompiler private (
     private lazy val wrapped: PackageDef = compiledCode match {
       case (pkg @ PackageDef(_, stats)) :: Nil => atPos(wrappedPos)(pkg)
       case code => atPos(wrappedPos) {
-        q"""
-          package $packageName {
+        q"""package ${atPos(beforePos)(Ident(packageName))} {
             $wrappedClass
-            $companion
-          }
-        """
+            ${atPos(afterPos)(companion)}
+          }"""
       }
     }
 
@@ -364,6 +409,7 @@ class ScalaCompiler private (
     private[kernel] lazy val typed = {
       val run = new Run()
       compilationUnit.body = wrapped
+      compilationUnit.lastBody = wrapped
       unitOfFile.put(sourceFile.file, compilationUnit)
       global.globalPhase = run.namerPhase // make sure globalPhase matches run phase
       run.namerPhase.asInstanceOf[global.GlobalPhase].apply(compilationUnit)
@@ -372,13 +418,25 @@ class ScalaCompiler private (
       exitingTyper(compilationUnit.body)
     }
 
+    private[kernel] def typedTreeAt(pos: Int) = zio.blocking.effectBlocking {
+      val run = new Run()
+      compilationUnit.body = wrapped
+      compilationUnit.lastBody = wrapped
+      unitOfFile.put(sourceFile.file, compilationUnit)
+      // this does a targeted-typecheck, which is more tolerant of errors. But, we have to make sure it's past the
+      // namer first or it will go through the parser which will throw position validation errors.
+      enteringPhase(currentRun.namerPhase)(currentRun.namerPhase.asInstanceOf[GlobalPhase].applyPhase(unitOfFile(sourceFile.file)))
+      compilationUnit.status = JustParsed
+      NscThief.typedTreeAt(global, Position.offset(sourceFile, pos))
+    }.lock(compilerThread)
+
     private[ScalaCompiler] def compile() = ZIO {
       val run = new Run()
       compilationUnit.body = wrapped
       unitOfFile.put(sourceFile.file, compilationUnit)
       ZIO {
         reporter.attempt {
-          run.compileUnits(List(compilationUnit), run.namerPhase)
+          withContextClassLoader(classLoader)(run.compileUnits(List(compilationUnit), run.namerPhase))
           exitingTyper(compilationUnit.body)
           // materialize these lazy vals now while the run is still active
           val _1 = cellClassSymbol
@@ -432,6 +490,16 @@ class ScalaCompiler private (
           // type trees don't get traversed in a useful way by default; traverse its original tree if it has one
           tree match {
             case tree@TypeTree() if tree.original != null => super.traverse(tree.original)
+            case tree@TypeTree() =>
+              // HACKY: check types in type args and search symbol chains to see whether they originate in previous cells.
+              val typeChains = tree.tpe.typeArgs.flatMap(_.prefixChain)
+              typeChains.foreach {
+                tpe =>
+                  val name = tpe.termSymbol.name
+                  if (inputCellSymbolNames.contains(name)) {
+                    used.add(name)
+                  }
+              }
             case _ =>
           }
 
@@ -453,9 +521,9 @@ class ScalaCompiler private (
         // TODO: should things you import from inside a package cell be imported elsewhere? Or should it be isolated?
         val selectors = stats.collect {
           case defTree: DefTree => defTree.name
-        }.zipWithIndex.map {
+        }.groupBy(_.toString).values.map(_.maxBy(_.isTermName)).zipWithIndex.map {
           case (name, index) => ImportSelector(name.toTermName, index, name.toTermName, index)
-        }
+        }.toList
 
         if (selectors.nonEmpty) {
           Imports(Nil, List(Import(copyAndReset(pkgId), selectors)))
@@ -474,13 +542,16 @@ class ScalaCompiler private (
         Imports(local.map(_._2.duplicate), external.map(_._2.duplicate))
     }
 
+    private def typedWithContextClassloader =
+      ZIO(withContextClassLoader(classLoader)(reporter.attempt(typed))).lock(compilerThread).absolve
+
     /**
       * Make a new [[CellCode]] that uses a minimal subset of inputs and prior cells.
       * After invoking, this [[CellCode]] will not be compilable – bin it!
       */
     def pruneInputs(): Task[CellCode] = if (inputs.nonEmpty || priorCells.nonEmpty) {
       for {
-        typedTree  <- ZIO(reporter.attempt(typed)).lock(compilerThread).absolve
+        typedTree  <- typedWithContextClassloader
         usedNames  <- ZIO(usedInputs).lock(compilerThread)
         usedDeps   <- ZIO(usedPriorCells)
         usedNameSet = usedNames.map(_.decodedName.toString).toSet
@@ -507,57 +578,66 @@ class ScalaCompiler private (
 
 object ScalaCompiler {
 
-  def access: ZIO[Provider, Nothing, ScalaCompiler]    = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler)
+  def access: ZIO[Provider, Nothing, ScalaCompiler]    = ZIO.access[ScalaCompiler.Provider](_.get)
   def settings: ZIO[Provider, Nothing, Settings]       = access.map(_.global.settings)
   def dependencies: ZIO[Provider, Nothing, List[File]] = access.map(_.dependencies)
 
-  def apply(settings: Settings, classLoader: Task[AbstractFileClassLoader], notebookPackage: String = "$notebook"): Task[ScalaCompiler] =
-    classLoader.memoize.flatMap {
-      classLoader => ZIO {
-        val global = new Global(settings, KernelReporter(settings))
-        new ScalaCompiler(global, notebookPackage, classLoader, Nil, settings.classpath.value.split(File.pathSeparatorChar).toList.map(new File(_)))
-      }
+  private val _kernelCounter = new AtomicInteger(0)
+  private[kernel] def kernelCounter: UIO[Int] = ZIO.effectTotal(_kernelCounter.getAndIncrement())
+
+  // Available for testing
+  private[polynote] def apply(settings: Settings, classLoader: AbstractFileClassLoader, notebookPackage: String = "notebook"): Task[ScalaCompiler] =
+    ZIO {
+      val global = new Global(settings, KernelReporter(settings))
+      new ScalaCompiler(global, notebookPackage, classLoader, Nil, settings.classpath.value.split(File.pathSeparatorChar).toList.map(new File(_)))
     }
 
+
+  /**
+    * @param dependencyClasspath List of class path entries for direct dependencies. Classes from these entries will be
+    *                            prioritized by auto-import/classpath-based completions in participating JVM languages.
+    * @param transitiveClasspath List of class path entries for transitive dependencies. These are still loaded in the
+    *                            notebook class loader, but they don't get higher priority for autocomplete.
+    * @param otherClasspath      List of class path entries which the compiler needs to know about, but which aren't
+    *                            going to be loaded by the dependency class loader (and thus will be loaded by the boot
+    *                            class loader). This basically means Spark and its ilk.
+    * @param modifySettings      A function which will receive the base compiler [[Settings]], and can return modified
+    *                            settings which will be used to construct the compiler.
+    * @return A [[ScalaCompiler]] instance
+    */
   def apply(
     dependencyClasspath: List[File],
+    transitiveClasspath: List[File],
     otherClasspath: List[File],
     modifySettings: Settings => Settings
   ): RIO[Config with System, ScalaCompiler] = for {
-    settings          <- ZIO(modifySettings(defaultSettings(new Settings(), dependencyClasspath ++ otherClasspath)))
+    settings          <- ZIO(modifySettings(defaultSettings(new Settings(), dependencyClasspath ++ transitiveClasspath ++ otherClasspath)))
     global            <- ZIO(new Global(settings, KernelReporter(settings)))
-    notebookPackage    = "$notebook"
-    classLoader       <- makeClassLoader(settings).memoize
+    counter           <- kernelCounter
+    notebookPackage    = s"notebook$counter"
+    classLoader       <- makeClassLoader(settings, dependencyClasspath ++ transitiveClasspath)
   } yield new ScalaCompiler(global, notebookPackage, classLoader, dependencyClasspath, otherClasspath)
 
-  def makeClassLoader(settings: Settings): RIO[Config, AbstractFileClassLoader] = for {
-    dependencyClassLoader <- makeDependencyClassLoader(settings)
+  def apply(dependencyClasspath: List[File], transitiveClasspath: List[File], otherClasspath: List[File]): RIO[Config with System, ScalaCompiler] =
+    apply(dependencyClasspath, transitiveClasspath, otherClasspath, identity[Settings])
+
+  def makeClassLoader(settings: Settings, dependencyClasspath: List[File]): RIO[Config, AbstractFileClassLoader] = for {
+    dependencyClassLoader <- makeDependencyClassLoader(settings, dependencyClasspath)
     compilerOutput        <- ZIO.fromOption(settings.outputDirs.getSingleOutput).mapError(_ => new IllegalArgumentException("Compiler must have a single output directory"))
   } yield new AbstractFileClassLoader(compilerOutput, dependencyClassLoader)
 
-  def makeDependencyClassLoader(settings: Settings): RIO[Config, URLClassLoader] = Config.access.flatMap {
+  def makeDependencyClassLoader(settings: Settings, dependencyClasspath: List[File]): RIO[Config, URLClassLoader] = Config.access.flatMap {
     config => ZIO {
-      val dependencyClassPath = settings.classpath.value.split(File.pathSeparator).toSeq.map(new File(_).toURI.toURL)
-
       if (config.behavior.dependencyIsolation) {
         new LimitedSharingClassLoader(
-          "^(scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j)\\.",
-          dependencyClassPath,
+          config.behavior.getSharedString,
+          dependencyClasspath.map(_.toURI.toURL),
           getClass.getClassLoader)
       } else {
-        new URLClassLoader(dependencyClassPath, getClass.getClassLoader)
+        new URLClassLoader(dependencyClasspath.map(_.toURI.toURL), getClass.getClassLoader)
       }
     }
   }
-
-  def provider(
-    dependencyClasspath: List[File],
-    otherClasspath: List[File],
-    modifySettings: Settings => Settings
-  ): RIO[Config with System, ScalaCompiler.Provider] = apply(dependencyClasspath, otherClasspath, modifySettings).map(Provider.of)
-
-  def provider(dependencyClasspath: List[File], otherClasspath: List[File]): RIO[Config with System, ScalaCompiler.Provider] =
-    provider(dependencyClasspath, otherClasspath, identity[Settings])
 
   private def pathAsFile(url: URL): File = url match {
     case url if url.getProtocol == "file" => new File(url.getPath)
@@ -579,6 +659,7 @@ object ScalaCompiler {
     val cp = classPath ++ requiredPaths
 
     val settings = initial.copy()
+    settings.target.value = "jvm-1.8" // set Java8 by default
     settings.classpath.append(cp.map(_.getCanonicalPath).mkString(File.pathSeparator))
     settings.Yrangepos.value = true
     try {
@@ -594,14 +675,12 @@ object ScalaCompiler {
     settings
   }
 
-  trait Provider {
-    val scalaCompiler: ScalaCompiler
-  }
+  type Provider = Has[ScalaCompiler]
 
   object Provider {
-    def of(compiler: ScalaCompiler): Provider = new Provider {
-      override val scalaCompiler: ScalaCompiler = compiler
-    }
+    def of(compiler: ScalaCompiler): Provider = Has(compiler)
   }
 
+  // Attachment for saving the original position of a tree (before the typer)
+  case class OriginalPos(pos: Position)
 }

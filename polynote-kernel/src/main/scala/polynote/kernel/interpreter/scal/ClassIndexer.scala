@@ -22,6 +22,7 @@ trait ClassIndexer {
     */
   def findMatches(name: String): UIO[Map[String, List[(Int, String)]]]
 
+  def await: UIO[Unit]
 }
 
 object ClassIndexer {
@@ -29,23 +30,21 @@ object ClassIndexer {
     SimpleClassIndexer()
 }
 
-class SimpleClassIndexer(running: Fiber[Throwable, TreeMap[String, List[(Int, String)]]]) extends ClassIndexer {
+class SimpleClassIndexer(ref: AtomicReference[TreeMap[String, List[(Int, String)]]], process: Fiber[Throwable, Any]) extends ClassIndexer {
 
-  override def findMatches(name: String): UIO[Map[String, List[(Int, String)]]] = running.poll.map {
-    case None => Map.empty
-    case Some(finished) => finished.fold(_ => Map.empty, index => getRange(index, name))
-  }
+  override def findMatches(name: String): UIO[Map[String, List[(Int, String)]]] =
+    ZIO.effectTotal(ref.get).map(_.range(name, name + Char.MaxValue))
 
-  def getRange(index: TreeMap[String, List[(Int, String)]], name: String): TreeMap[String, List[(Int, String)]] = {
-    val result = index.range(name, name + Char.MaxValue)
-    result
-  }
-
+  override def await: UIO[Unit] = process.await.unit
 }
 
 object SimpleClassIndexer {
   def apply(): ZIO[Blocking with ScalaCompiler.Provider, Nothing, SimpleClassIndexer] = {
-    def buildIndex(priorityDependencies: Array[File], classPath: Array[File]) = effectBlocking {
+    def buildIndex(
+      priorityDependencies: Array[File],
+      classPath: Array[File],
+      classes: AtomicReference[TreeMap[String, List[(Int, String)]]]
+    ) = effectBlocking {
       import scala.collection.JavaConverters._
 
       val lastPriority = priorityDependencies.length + classPath.length
@@ -53,7 +52,6 @@ object SimpleClassIndexer {
 
       val classGraph = new ClassGraph().overrideClasspath(priorityDependencies ++ classPath: _*).enableClassInfo()
       val scanResult = classGraph.scan()
-      val classes = new AtomicReference[TreeMap[String, List[(Int, String)]]](new TreeMap)
       scanResult.getAllClasses.iterator().asScala
         .filter(_.isPublic)
         .filterNot(_.isSynthetic)
@@ -78,8 +76,9 @@ object SimpleClassIndexer {
     for {
       classPath <- ScalaCompiler.settings.map(_.classpath.value.split(File.pathSeparatorChar).map(new File(_)))
       deps      <- ScalaCompiler.dependencies
-      javaPath   = javaLibraryPath.toArray :+ new File(pathOf(classOf[List[_]]).toURI)
-      process   <- buildIndex(javaPath ++ deps, classPath).fork
-    } yield new SimpleClassIndexer(process)
+      priorities = new File(pathOf(classOf[List[_]]).toURI) :: javaLibraryPath.toList ::: deps
+      indexRef   = new AtomicReference[TreeMap[String, List[(Int, String)]]](new TreeMap)
+      process   <- buildIndex(priorities.toArray, classPath, indexRef).forkDaemon
+    } yield new SimpleClassIndexer(indexRef, process)
   }
 }
